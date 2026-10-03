@@ -37,6 +37,7 @@ void usage() {
         "  --M N                     HNSW max connections (default 16)\n"
         "  --ef-construction N       HNSW build beam width (default 200)\n"
         "  --ef-search A[,B,...]     HNSW search beam width(s); one run + CSV row each (default 50)\n"
+        "  --heuristic 0|1           HNSW neighbor selection: 1 = Algorithm 4 (default), 0 = M closest\n"
         "  --seed N                  RNG seed (default 42)\n"
         "  --max-queries N           use only the first N queries (default all)\n"
         "  --csv PATH                append results here (default results/results.csv; 'none' disables)\n",
@@ -59,7 +60,7 @@ double seconds(Clock::time_point a, Clock::time_point b) {
 int main(int argc, char** argv) {
     std::map<std::string, std::string> opt = {{"index", "bruteforce"}, {"k", "10"},
                                               {"M", "16"},            {"ef-construction", "200"},
-                                              {"ef-search", "50"},    {"seed", "42"},
+                                              {"ef-search", "50"},    {"seed", "42"},       {"heuristic", "1"},
                                               {"max-queries", "0"},   {"csv", "results/results.csv"}};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -108,11 +109,13 @@ int main(int argc, char** argv) {
         const size_t M = std::stoull(opt["M"]);
         const size_t efc = std::stoull(opt["ef-construction"]);
         const uint64_t seed = std::stoull(opt["seed"]);
-        const bool is_hnsw = opt["index"] == "hnsw";
+        const bool is_hnsw = opt["index"] == "hnsw";  // "hnsw-simple" in output = heuristic off
 
         std::unique_ptr<hnsw::Index> index;
         if (is_hnsw) {
-            index = std::make_unique<hnsw::HnswIndex>(base.dim, M, efc, base.count, seed);
+            auto h = std::make_unique<hnsw::HnswIndex>(base.dim, M, efc, base.count, seed);
+            h->set_use_heuristic(opt["heuristic"] != "0");
+            index = std::move(h);
         } else if (opt["index"] == "bruteforce") {
             index = std::make_unique<hnsw::BruteForceIndex>(base.dim);
         } else {
