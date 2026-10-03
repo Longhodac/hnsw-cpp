@@ -1,0 +1,2 @@
+add_executable(bench_distance bench_distance.cpp)
+target_link_libraries(bench_distance PRIVATE hnsw hnsw_options benchmark::benchmark_main)

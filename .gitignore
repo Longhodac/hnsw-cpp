@@ -1,0 +1,10 @@
+build/
+data/*
+!data/.gitkeep
+.cache/
+.venv/
+__pycache__/
+results/
+*.png
+compile_commands.json
+.DS_Store
