@@ -61,8 +61,9 @@ target_include_directories(hnsw PUBLIC include)
 target_link_libraries(hnsw PRIVATE hnsw_options)
 
 # ---- Eval CLI ----
+find_package(Threads REQUIRED)
 add_executable(eval tools/eval.cpp)
-target_link_libraries(eval PRIVATE hnsw hnsw_options)
+target_link_libraries(eval PRIVATE hnsw hnsw_options Threads::Threads)
 
 if(HNSW_BUILD_TESTS)
     enable_testing()

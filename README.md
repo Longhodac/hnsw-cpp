@@ -66,7 +66,7 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 2. Single-threaded HNSW. Done.
 3. Parameter tuning of `M`, `efConstruction` and `ef`. Done, results below.
 4. SIMD and profiling. NEON distance and prefetching done (about 2.8x faster queries). Heap work and memory layout still open.
-5. Concurrent inserts. Per-thread search scratch, preallocated storage and locked, atomic-slot `add` are done and pass TSan. `eval --threads N` and the scaling measurement are next.
+5. Concurrent inserts and searches. Done: 5.4x faster build and 4.9x more QPS on 10 threads.
 6. mmap persistence.
 7. FAISS comparison with pybind11 bindings.
 
@@ -122,6 +122,58 @@ Each row is two runs made back to back at `M=16`, `efC=100`, with identical reca
 Together, NEON and prefetch give about 2.8x the QPS at recall 0.95 (7,700 to 21,800) and a 2.4x faster build (170 s to 70 s) compared with the Phase 3 scalar build. I had estimated memory waits at about 16% of query time. Prefetch removed about 37% of it, so the waits were larger than my estimate.
 
 **How it was checked.** The unit tests compare the NEON and scalar functions for every dimension from 0 to 300 within a relative tolerance of 1e-5, and also cover unaligned pointers and an exact zero for identical vectors. The distance tests pass under AddressSanitizer, which catches reads past the end of an array. Recall at every `ef` matched the scalar build, and also matched with and without prefetch. The HNSW tests pass under AddressSanitizer with prefetching on.
+
+## Phase 5: concurrent inserts and searches
+
+Status: done. `add` and `search` are both safe to call from many threads at once.
+
+**What changed.**
+- Each thread keeps its own visited-tag scratch, so searches no longer share state.
+- All storage is sized up front and never moves, and ids come from an atomic counter.
+- Neighbor-list slots are atomic. Searches take no locks. An insert takes one of 4,096 striped mutexes (chosen by node id) while it rewrites a neighbor list, and never holds two at once, so the locks cannot deadlock.
+- One global mutex covers the entry point and top layer. An insert takes it only when its node raises the top layer, which happens about log N times in a whole build.
+- A node's level is a hash of the seed and its id, not a draw from a shared generator, so it does not depend on thread timing.
+
+**How readers and writers stay safe.** A node's vector and link storage are written before its id goes into any neighbor slot. Slots are stored with release ordering and loaded with acquire ordering, so a thread that reads an id from a slot also sees that node's data. A search that overlaps a rewrite may read a mix of old and new ids from one list. Every id in a list is always a valid node on that layer, so the cost is at worst a skipped or repeated link.
+
+**Results.** SIFT1M, `M=16`, `efC=100`, seed 42, on a Mac with 4 performance and 6 efficiency cores. Build rows are two runs per thread count. Query rows are two runs each over 20 passes of the query set.
+
+| Build threads | Build time | Speedup | Recall@10 at `ef` 60 |
+|---|---|---|---|
+| 1 | 70.4 s | 1.0x | 0.9514 |
+| 2 | 36.5 s | 1.9x | 0.9514 |
+| 4 | 20.4 s | 3.5x | 0.9513 |
+| 6 | 16.4 s | 4.3x | 0.9512 |
+| 8 | 14.1 s | 5.0x | 0.9513 |
+| 10 | 13.0 s | 5.4x | 0.9510 |
+
+| Query threads | QPS at `ef` 60 | Speedup | p99 at `ef` 60 | QPS at `ef` 140 | Speedup |
+|---|---|---|---|---|---|
+| 1 | 21,400 | 1.0x | 64 µs | 10,400 | 1.0x |
+| 2 | 41,100 | 1.9x | 68 µs | 20,000 | 1.9x |
+| 4 | 72,700 | 3.4x | 101 µs | 35,600 | 3.4x |
+| 6 | 88,000 | 4.1x | 114 µs | 43,400 | 4.2x |
+| 8 | 99,800 | 4.7x | 192 µs | 49,100 | 4.7x |
+| 10 | 105,500 | 4.9x | 297 µs | 51,900 | 5.0x |
+
+Queries in the second table ran against a graph built by one thread, with recall 0.9514 at `ef` 60 and 0.9873 at `ef` 140 in every row.
+
+**Reading the numbers.** Scaling is close to linear up to 4 threads, which matches the 4 performance cores. After that each extra thread adds less, because the slower efficiency cores join and the threads compete for memory bandwidth. Tail latency grows with it, from 64 µs at one thread to 297 µs at ten. Building with 10 threads is 13 seconds, down from 170 seconds with the Phase 3 scalar build.
+
+Recall stays within 0.0004 of the single-thread build at every thread count. A parallel build gives a slightly different graph on every run, because the order in which threads insert nodes varies.
+
+**A bug the sanitizers found.** In a parallel build, a node could end up linked to itself. Another thread could link a newer node to the new node on a lower layer first. The new node's own search then reached itself at distance 0 through that newer node and picked itself as a neighbor. A single thread cannot hit this. The insert now drops the new node from its own search results, and `add_link` refuses self-links. `ManySmallParallelBuildsStayValid` builds 40 small dense graphs with 8 threads and failed 20 times out of 20 with the fix removed.
+
+**How it was checked.** All 52 tests pass in release and under both AddressSanitizer and ThreadSanitizer. The concurrency tests ran 200 times in release, 30 times under ASan and 15 times under TSan with no failures and no race reports. They cover parallel searches matching serial results, parallel builds producing a valid graph, frequent top-layer changes, searches running during inserts, and a parallel fill to exact capacity. Every test has a 300-second timeout, so a deadlock fails the test instead of hanging it.
+
+**Run it.**
+
+```bash
+build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100 --threads 8 --ef-search 60,140
+build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100 --ef-search 60 --search-threads 1,2,4,8 --query-repeat 20
+```
+
+`--threads` sets the build threads and `--search-threads` takes a list of query thread counts. `--query-repeat R` loops the query set R times so a fast multi-thread run lasts long enough to time. Recall and latency come from the first pass. The CSV gains `build_threads` and `search_threads` columns at the end, so use a fresh CSV file for runs with these options.
 
 ## Benchmark results
 
