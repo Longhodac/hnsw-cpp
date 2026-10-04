@@ -212,3 +212,53 @@ TEST(HnswStorage, AddLinkRefusesSelfLinksAndDuplicates) {
     HnswTestAccess::add_link(idx, 0, 1, 1.f, 0);  // duplicate: ignored
     EXPECT_EQ(HnswTestAccess::nbrs(idx, 0, 0), std::vector<uint32_t>{1});
 }
+
+TEST(HnswStorage, UpperBlocksOfOneNodeAreAdjacent) {
+    const size_t M = 4;
+    HnswIndex idx(1, M, 10, 8, 1);
+    const float v[] = {0};
+    const auto id = HnswTestAccess::allocate(idx, v, 3);
+    const auto* l1 = static_cast<const uint32_t*>(HnswTestAccess::link_ptr(idx, id, 1));
+    const auto* l2 = static_cast<const uint32_t*>(HnswTestAccess::link_ptr(idx, id, 2));
+    const auto* l3 = static_cast<const uint32_t*>(HnswTestAccess::link_ptr(idx, id, 3));
+    EXPECT_EQ(l2 - l1, static_cast<long>(1 + M));
+    EXPECT_EQ(l3 - l2, static_cast<long>(1 + M));
+}
+
+TEST(HnswStorage, UpperBlocksOfDifferentNodesDoNotOverlap) {
+    const size_t M = 4;
+    HnswIndex idx(1, M, 10, 16, 1);
+    const float v[] = {0};
+    std::vector<std::pair<const uint32_t*, const uint32_t*>> spans;  // [begin, end) per node
+    for (int level : {1, 3, 2, 1, 5}) {
+        const auto id = HnswTestAccess::allocate(idx, v, level);
+        const auto* first = static_cast<const uint32_t*>(HnswTestAccess::link_ptr(idx, id, 1));
+        spans.emplace_back(first, first + static_cast<size_t>(level) * (1 + M));
+    }
+    for (size_t a = 0; a < spans.size(); ++a) {
+        for (size_t b = a + 1; b < spans.size(); ++b) {
+            EXPECT_TRUE(spans[a].second <= spans[b].first || spans[b].second <= spans[a].first)
+                << "nodes " << a << " and " << b << " overlap";
+        }
+    }
+}
+
+TEST(HnswStorage, FullUpperArenaThrowsButLevel0NodesStillFit) {
+    // M = 1000 and level 255 make each node need 255 * 1001 slots, so the million-slot arena
+    // holds only four of them.
+    HnswIndex idx(1, 1000, 10, 16, 1);
+    const float v[] = {0};
+    int ok = 0;
+    bool threw = false;
+    for (int i = 0; i < 8 && !threw; ++i) {
+        try {
+            HnswTestAccess::allocate(idx, v, 255);
+            ++ok;
+        } catch (const std::length_error&) {
+            threw = true;
+        }
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(ok, 4);
+    EXPECT_NO_THROW(HnswTestAccess::allocate(idx, v, 0));  // needs no arena space
+}

@@ -1,6 +1,6 @@
 # hnsw-cpp
 
-A from-scratch C++20 implementation of HNSW (Hierarchical Navigable Small World). I wrote it to learn systems programming, and I benchmark it against FAISS on the SIFT dataset. The core library has no ANN or linear-algebra dependencies.
+A from-scratch C++20 implementation of HNSW (Hierarchical Navigable Small World), written to learn systems programming. It is tested and benchmarked on the SIFT dataset, and a comparison against FAISS is the last roadmap item. The core library has no ANN or linear-algebra dependencies.
 
 ## HNSW in simple words
 
@@ -67,7 +67,7 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 3. Parameter tuning of `M`, `efConstruction` and `ef`. Done, results below.
 4. SIMD and profiling. NEON distance and prefetching done (about 2.8x faster queries). Heap work and memory layout still open.
 5. Concurrent inserts and searches. Done: 5.4x faster build and 4.9x more QPS on 10 threads.
-6. mmap persistence.
+6. mmap persistence. Done: 1 ms load against a 69 s build.
 7. FAISS comparison with pybind11 bindings.
 
 ## Phase 4: SIMD distance
@@ -119,7 +119,7 @@ The QPS and build rows come from two scalar runs and two NEON runs made back to 
 
 Each row is two runs made back to back at `M=16`, `efC=100`, with identical recall at every `ef`. Prefetching the whole vector is about 1.6x faster at `ef=60`. The first-line version gains only about 10%, because a 512-byte vector spans four or five 128-byte cache lines and the later lines need their own requests. Runs at `ef` of 140 and 160 were noisy in every build, so the table uses lower values.
 
-Together, NEON and prefetch give about 2.8x the QPS at recall 0.95 (7,700 to 21,800) and a 2.4x faster build (170 s to 70 s) compared with the Phase 3 scalar build. I had estimated memory waits at about 16% of query time. Prefetch removed about 37% of it, so the waits were larger than my estimate.
+Together, NEON and prefetch give about 2.8x the QPS at recall 0.95 (7,700 to 21,800) and a 2.4x faster build (170 s to 70 s) compared with the Phase 3 scalar build. An early estimate put memory waits at about 16% of query time. Prefetch removed about 37%, so the waits were larger than estimated.
 
 **How it was checked.** The unit tests compare the NEON and scalar functions for every dimension from 0 to 300 within a relative tolerance of 1e-5, and also cover unaligned pointers and an exact zero for identical vectors. The distance tests pass under AddressSanitizer, which catches reads past the end of an array. Recall at every `ef` matched the scalar build, and also matched with and without prefetch. The HNSW tests pass under AddressSanitizer with prefetching on.
 
@@ -175,31 +175,90 @@ build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100
 
 `--threads` sets the build threads and `--search-threads` takes a list of query thread counts. `--query-repeat R` loops the query set R times so a fast multi-thread run lasts long enough to time. Recall and latency come from the first pass. The CSV gains `build_threads` and `search_threads` columns at the end, so use a fresh CSV file for runs with these options.
 
+## Phase 6: saving and loading with mmap
+
+Status: done. `HnswIndex::save(path)` writes the index to one file, and `HnswIndex::load(path)` maps it back in place. A loaded index is read-only, and `add` on it throws.
+
+**How loading works.** `mmap` makes a file's bytes appear as ordinary memory. Nothing is copied or parsed at load. The operating system reads a 16 KiB page from disk the first time a search touches it, so load takes about a millisecond whatever the index size. Searches then run on the mapped bytes with the same code as an index built in memory.
+
+**File format.** A 128-byte header, then five sections, each on a 128-byte boundary: vectors, node levels, layer 0 links, upper-layer offsets, and the upper-layer link arena. The header holds a magic string, a version, a byte-order marker, the parameters, the section offsets and a CRC-32 of itself. The format is defined in `include/hnsw/index_file.hpp`. For SIFT1M with `M=16` the file is 653.6 MB, 78% of it vectors.
+
+**Storage changes this needed.** Layer 1 and above links used to live in a separate heap allocation per node, reached through a pointer, and pointers cannot go in a file. They now live in one flat arena, and each node stores an offset into it. A bump allocator hands out arena blocks during a build, with no lock. The arena is sized at 8 times the expected need as lazily committed memory, and a build throws `length_error` if it ever fills. Every array sits in a small `MemoryRegion` wrapper over `mmap`, and neighbor-list slots are plain `uint32_t` read and written through `std::atomic_ref`, so the same bytes work in memory and in a file.
+
+**Results.** SIFT1M, `M=16`, `efC=100`, serial build, warm file cache.
+
+| Measurement | Value |
+|---|---|
+| Build from scratch | 69.3 s |
+| Save | 0.39 s, 653.6 MB |
+| Load | 1.1 to 2.8 ms |
+| Load with `verify` (checks every link) | 25.8 ms |
+| Peak memory right after load | 18.7 MB |
+| Peak memory after a full query pass | 677 MB |
+| QPS at `ef` 60, loaded vs built in memory | 21,200 vs 20,900 |
+| QPS at `ef` 140, loaded vs built in memory | 10,700 vs 10,700 |
+| QPS with 10 query threads, `ef` 60 and 140 | 108,000 and 53,400 |
+| Recall@10 at `ef` 60 and 140, loaded and built | 0.9514 and 0.9873, identical |
+
+Loading is about 25,000 times faster than rebuilding, and the loaded index is as fast as the one built in memory once its pages are touched.
+
+The first loaded run after the save was slower. Its first query took 81 ms and its first pass ran at 7,200 QPS with a p99 of 430 µs, against about 1 ms and 21,000 QPS in every later run. That fits part of the file not being resident yet. A truly cold cache needs `sudo purge` on macOS, which needs root and was not run, so cold-start numbers are not measured here.
+
+**What load checks.** The default load checks the header, the byte order, the version, the header checksum, the section offsets against the file size, and that the entry node's level matches. That takes microseconds and reads no node data. It cannot see a damaged link, so only load files this program wrote. `LoadOptions{.verify = true}` also scans every link for out-of-range ids, self links, wrong layers and bad offsets, which cost 25.8 ms here with a warm cache.
+
+**Limits.** A loaded index is read-only. The format is little-endian only, and loading uses POSIX `mmap`, so it targets macOS and Linux. The file stores no external ids, so `eval --save` writes `PATH.rows` next to a parallel-built index, which maps each id back to its base row.
+
+**How it was checked.** All 72 tests pass in release and under both sanitizers. Round-trip tests compare 200 queries id for id against the original at three `ef` values, for serial-built, parallel-built, empty and single-node indexes. A table of 13 damaged files, including a bad magic, a future version, a flipped header bit, truncation and an inflated count, is each refused with a message that names the problem. A second table of 5 files with a damaged link inside a section loads under the default checks, and `verify` rejects each one. The save tests cover the exact file layout, overwriting an existing file, a missing directory, and no temporary file left behind.
+
+**Run it.**
+
+```bash
+build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100 --threads 10 --ef-search 60 --save results/sift.idx
+build/release/eval --dataset data/sift --index hnsw --load results/sift.idx --ef-search 60,60 --search-threads 1,10 --query-repeat 20
+```
+
+The first command builds in parallel and saves. The second loads without building and prints the load time, the first query's latency and the peak memory. `--verify 1` adds the link scan. Listing an `ef` twice shows the pass that pays for page faults next to the warm one.
+
 ## Benchmark results
 
 ### Setup
 
 - Dataset: SIFT1M, 1,000,000 base vectors, 10,000 queries, 128 dimensions.
 - Metric: recall@10 against the exact ground truth, and queries per second (QPS).
-- Build: release preset, single thread. Phase 3 numbers use the scalar distance function. Phase 4 above gives the NEON numbers.
+- Machine: one Mac with an M5 chip (4 performance and 6 efficiency cores), release preset.
 - Seed 42 unless stated. Brute force reaches recall 0.9995 on this data, not 1.0, because of distance ties in the ground truth. Treat 0.9995 as the practical ceiling.
+- QPS varies by 3% to 16% between runs of the same code (see Noise), so compare numbers only within one table.
+
+### Summary
+
+Every row uses `M=16`, `efConstruction=100` and `ef=60`, where recall@10 is about 0.951. Rows 1 to 3 come from back-to-back runs. Row 4 comes from the Phase 5 and Phase 6 runs, so its ratio to the other rows carries the usual run-to-run noise.
+
+| Stage | QPS | Build time |
+|---|---|---|
+| Phase 3, scalar distance, 1 thread | about 7,700 | about 170 s |
+| NEON distance, 1 thread | about 13,800 | about 104 s |
+| NEON and prefetch, 1 thread | about 21,800 | about 70 s |
+| NEON and prefetch, 10 query threads, 10 build threads | about 108,000 | about 13 s |
+| Same index loaded from a file | same as built | 1.1 ms to load |
+
+Compared with the Phase 3 build, one thread is about 2.8x faster at queries, ten threads are about 14x faster, and a ten-thread build takes 13 s instead of 170 s. A saved index loads in about a millisecond where a rebuild takes 69 s. Recall did not change at any stage. The phase sections above have the tables behind each row.
 
 ### Recommended setting
 
-`M=16`, `efConstruction=100`.
+`M=16`, `efConstruction=100`, with the final build (NEON, prefetch).
 
-| Target | `ef` | QPS | Mean latency | p99 latency |
+| Target | `ef` | QPS, 1 thread | Mean latency | p99 latency |
 |---|---|---|---|---|
-| recall@10 ≥ 0.95 | about 59 | about 9,100 | about 110 µs | about 150 µs |
-| recall@10 ≥ 0.99 | about 159 | about 4,000 | about 250 µs | about 350 µs |
+| recall@10 of 0.95 | about 59 | about 22,000 | about 45 µs | about 65 µs |
+| recall@10 of 0.99 | about 158 | about 9,500 | about 100 µs | about 135 µs |
 
-The build takes 161 s, and layer 0 plus the vectors use about 0.65 GB (computed from the storage layout, not measured). If you need every bit of query speed and can spend 285 s on the build, use `efConstruction=200`. It is about 3% faster at recall 0.95 and about 10% faster at recall 0.99.
+A serial build takes about 69 s (68 s to 71 s over several runs), and a build on 10 threads takes about 13 s. A loaded index reaches 677 MB of resident memory after a full query pass. With 10 query threads, `ef` 60 reached 108,000 QPS and `ef` 140 reached 53,400 QPS (Phase 6 table).
 
-These numbers come from the seed 7 rerun, where `efConstruction=100` and `efConstruction=200` ran back to back. The first `efConstruction=100` run was slower for reasons outside the code (see Noise).
+The `ef` and QPS values come from the Phase 5 and Phase 6 runs on the final build, interpolated between `ef` 60, 140 and 160. In the Phase 3 sweep, `efConstruction=200` queried 3% to 10% faster than 100 but took 285 s to build with the scalar distance. That comparison was not repeated with NEON and prefetch.
 
 ### Parameter sweep
 
-Interpolated from the measured recall/QPS points, all on SIFT1M, `ef` swept from 10 to 800 (or 400).
+Phase 3 measurements with the scalar distance function, interpolated between the measured recall and QPS points. `ef` swept from 10 to 800 (or 400). Absolute QPS is about 2.8x lower than the final build, but the comparisons between rows hold.
 
 | `M` | `efConstruction` | Build | `ef` at 0.95 | QPS at 0.95 | `ef` at 0.99 | QPS at 0.99 |
 |---|---|---|---|---|---|---|
@@ -211,7 +270,7 @@ Interpolated from the measured recall/QPS points, all on SIFT1M, `ef` swept from
 | 32 | 200 | 437 s | 36 | 7,600 | 91 | 3,900 |
 | 48 | 200 | 426 s | 34 | 8,600 | 83 | 4,300 |
 
-The `efConstruction=100` row comes from the first, slower run. The back-to-back rerun in the recommendation above gives 9,100 and 4,000 QPS.
+The `efConstruction=100` row comes from a first run that was slower for reasons outside the code. A back-to-back rerun against `efConstruction=200` gave about 9,100 and 4,000 QPS for it (see Noise).
 
 ![Recall@10 vs QPS for each M and efConstruction pair on SIFT1M](docs/phase3_recall_qps.png)
 

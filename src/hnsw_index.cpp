@@ -48,6 +48,18 @@ struct VisitedScratch {
 
 thread_local VisitedScratch tls_visited;
 
+// Neighbor-list slots are plain uint32_t, accessed through atomic_ref so searches can read a
+// list while an insert rewrites it, and so the same bytes can later sit in a file mapping.
+inline uint32_t load_acquire(const uint32_t* p) {
+    return std::atomic_ref<uint32_t>(*const_cast<uint32_t*>(p)).load(std::memory_order_acquire);
+}
+inline uint32_t load_relaxed(const uint32_t* p) {
+    return std::atomic_ref<uint32_t>(*const_cast<uint32_t*>(p)).load(std::memory_order_relaxed);
+}
+inline void store_release(uint32_t* p, uint32_t v) {
+    std::atomic_ref<uint32_t>(*p).store(v, std::memory_order_release);
+}
+
 // Per-thread buffer that holds one neighbor-list snapshot. search_layer and greedy_closest
 // never run inside each other, so they can share it.
 uint32_t* nbr_buffer(size_t n) {
@@ -72,10 +84,23 @@ HnswIndex::HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_el
         throw std::invalid_argument("HnswIndex: max_elements must fit in uint32_t ids");
     }
     // Everything is sized once, so no later insert reallocates or moves data other threads read.
-    vectors_ = std::make_unique_for_overwrite<float[]>(max_elements * dim);  // pages fault in lazily
-    levels_ = std::make_unique<uint8_t[]>(max_elements);
-    level0_links_ = std::make_unique<LinkSlot[]>(max_elements * (1 + 2 * M));  // zeroed: count 0
-    upper_links_.resize(max_elements);
+    // Anonymous regions are zero-filled and only use memory for pages that get touched.
+    vectors_region_ = MemoryRegion::anonymous(max_elements * dim * sizeof(float));
+    levels_region_ = MemoryRegion::anonymous(max_elements);
+    level0_region_ = MemoryRegion::anonymous(max_elements * (1 + 2 * M) * sizeof(uint32_t));
+    upper_offset_region_ = MemoryRegion::anonymous(max_elements * sizeof(uint32_t));
+    vectors_ = static_cast<float*>(vectors_region_.data());
+    levels_ = static_cast<uint8_t*>(levels_region_.data());
+    level0_ = static_cast<uint32_t*>(level0_region_.data());
+    upper_offset_ = static_cast<uint32_t*>(upper_offset_region_.data());
+
+    // Each node has expected (1 + M) / (M - 1) upper slots. Reserve 8 times that, at least a
+    // million slots. Untouched pages cost nothing, so a generous arena is free.
+    const size_t expected = max_elements * (1 + M) / (M - 1) + 1;
+    upper_arena_capacity_ = std::min<size_t>(std::max<size_t>(8 * expected, size_t{1} << 20),
+                                             std::numeric_limits<uint32_t>::max());
+    upper_arena_region_ = MemoryRegion::anonymous(upper_arena_capacity_ * sizeof(uint32_t));
+    upper_arena_ = static_cast<uint32_t*>(upper_arena_region_.data());
     link_locks_ = std::make_unique<std::mutex[]>(kLockStripes);
 }
 
@@ -87,13 +112,21 @@ uint32_t HnswIndex::reserve_id() {
     return static_cast<uint32_t>(next);
 }
 
-void HnswIndex::init_node(uint32_t id, const float* vec, int level) {
-    std::copy(vec, vec + dim_, vectors_.get() + static_cast<size_t>(id) * dim_);
-    levels_[id] = static_cast<uint8_t>(level);
-    if (level > 0) {
-        // One zeroed block (count + M slots) per layer 1..level.
-        upper_links_[id] = std::make_unique<LinkSlot[]>(static_cast<size_t>(level) * (1 + M_));
+uint32_t HnswIndex::alloc_upper(size_t slots) {
+    const size_t offset = upper_arena_used_.fetch_add(slots, std::memory_order_relaxed);
+    if (offset + slots > upper_arena_capacity_) {
+        throw std::length_error("HnswIndex: upper-layer arena full");
     }
+    return static_cast<uint32_t>(offset);
+}
+
+void HnswIndex::init_node(uint32_t id, const float* vec, int level) {
+    // One zeroed block (count + M slots) per layer 1..level. Allocate first so a full arena
+    // leaves the node untouched.
+    const uint32_t offset = level > 0 ? alloc_upper(static_cast<size_t>(level) * (1 + M_)) : 0;
+    std::copy(vec, vec + dim_, vectors_ + static_cast<size_t>(id) * dim_);
+    levels_[id] = static_cast<uint8_t>(level);
+    upper_offset_[id] = offset;
 }
 
 uint32_t HnswIndex::allocate_node(const float* vec, int level) {
@@ -105,17 +138,17 @@ uint32_t HnswIndex::allocate_node(const float* vec, int level) {
     return id;
 }
 
-HnswIndex::LinkSlot* HnswIndex::link_block(uint32_t id, int layer) const {
+uint32_t* HnswIndex::link_block(uint32_t id, int layer) const {
     assert(id < count_ && layer >= 0 && layer <= levels_[id]);
-    if (layer == 0) return level0_links_.get() + static_cast<size_t>(id) * (1 + 2 * M_);
-    return upper_links_[id].get() + static_cast<size_t>(layer - 1) * (1 + M_);
+    if (layer == 0) return level0_ + static_cast<size_t>(id) * (1 + 2 * M_);
+    assert(upper_offset_[id] != 0);
+    return upper_arena_ + upper_offset_[id] + static_cast<size_t>(layer - 1) * (1 + M_);
 }
 
 size_t HnswIndex::snapshot_neighbors(uint32_t id, int layer, uint32_t* out) const {
-    const LinkSlot* block = link_block(id, layer);
-    const size_t count = std::min<size_t>(block[0].load(std::memory_order_acquire),
-                                          max_degree(layer));
-    for (size_t i = 0; i < count; ++i) out[i] = block[1 + i].load(std::memory_order_acquire);
+    const uint32_t* block = link_block(id, layer);
+    const size_t count = std::min<size_t>(load_acquire(&block[0]), max_degree(layer));
+    for (size_t i = 0; i < count; ++i) out[i] = load_acquire(&block[1 + i]);
     return count;
 }
 
@@ -127,9 +160,9 @@ std::vector<uint32_t> HnswIndex::neighbors(uint32_t id, int layer) const {
 
 void HnswIndex::set_neighbors(uint32_t id, int layer, std::span<const uint32_t> ns) {
     assert(ns.size() <= max_degree(layer));
-    LinkSlot* block = link_block(id, layer);
-    for (size_t i = 0; i < ns.size(); ++i) block[1 + i].store(ns[i], std::memory_order_release);
-    block[0].store(static_cast<uint32_t>(ns.size()), std::memory_order_release);
+    uint32_t* block = link_block(id, layer);
+    for (size_t i = 0; i < ns.size(); ++i) store_release(&block[1 + i], ns[i]);
+    store_release(&block[0], static_cast<uint32_t>(ns.size()));
 }
 
 int HnswIndex::random_level(uint32_t id) const {
@@ -252,16 +285,16 @@ std::vector<Neighbor> HnswIndex::select_neighbors(const std::vector<Neighbor>& c
 
 void HnswIndex::add_link_locked(uint32_t node, uint32_t new_nbr, float dist, int layer) {
     if (new_nbr == node) return;  // never link a node to itself
-    LinkSlot* block = link_block(node, layer);
+    uint32_t* block = link_block(node, layer);
     // The lock makes this thread the only writer, so it can read its own list relaxed.
-    const size_t count = block[0].load(std::memory_order_relaxed);
+    const size_t count = load_relaxed(&block[0]);
     const size_t cap = max_degree(layer);
     for (size_t i = 0; i < count; ++i) {
-        if (block[1 + i].load(std::memory_order_relaxed) == new_nbr) return;  // already linked
+        if (load_relaxed(&block[1 + i]) == new_nbr) return;  // already linked
     }
     if (count < cap) {
-        block[1 + count].store(new_nbr, std::memory_order_release);
-        block[0].store(static_cast<uint32_t>(count + 1), std::memory_order_release);
+        store_release(&block[1 + count], new_nbr);
+        store_release(&block[0], static_cast<uint32_t>(count + 1));
         return;
     }
     // Full: choose the best `cap` among current neighbors plus the newcomer.
@@ -269,17 +302,15 @@ void HnswIndex::add_link_locked(uint32_t node, uint32_t new_nbr, float dist, int
     cands.reserve(count + 1);
     cands.emplace_back(dist, new_nbr);
     for (size_t i = 0; i < count; ++i) {
-        const uint32_t id = block[1 + i].load(std::memory_order_relaxed);
+        const uint32_t id = load_relaxed(&block[1 + i]);
         cands.emplace_back(l2_sqr(vector_at(node), vector_at(id), dim_), id);
     }
     std::sort(cands.begin(), cands.end());
     const auto kept = select_neighbors(cands, cap);
     // Readers may see a mix of old and new ids while this runs. Every slot always holds a
     // valid node id on this layer, so a mixed read only costs a duplicate or a skipped link.
-    for (size_t i = 0; i < kept.size(); ++i) {
-        block[1 + i].store(kept[i].second, std::memory_order_release);
-    }
-    block[0].store(static_cast<uint32_t>(kept.size()), std::memory_order_release);
+    for (size_t i = 0; i < kept.size(); ++i) store_release(&block[1 + i], kept[i].second);
+    store_release(&block[0], static_cast<uint32_t>(kept.size()));
 }
 
 void HnswIndex::add_link(uint32_t node, uint32_t new_nbr, float dist, int layer) {
@@ -295,6 +326,7 @@ void HnswIndex::set_own_links(uint32_t id, const std::vector<Neighbor>& chosen, 
 }
 
 uint32_t HnswIndex::add(const float* vec) {
+    if (read_only_) throw std::logic_error("HnswIndex: a loaded index is read-only");
     const uint32_t id = reserve_id();  // throws if full
     const int level = random_level(id);
     init_node(id, vec, level);

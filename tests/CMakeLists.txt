@@ -3,6 +3,8 @@ add_executable(hnsw_tests
     test_distance.cpp
     test_brute_force.cpp
     test_metrics.cpp
+    test_memory_region.cpp
+    test_persistence.cpp
     test_hnsw_storage.cpp
     test_hnsw.cpp)
 find_package(Threads REQUIRED)

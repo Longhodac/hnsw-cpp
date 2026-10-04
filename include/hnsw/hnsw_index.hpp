@@ -5,9 +5,12 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "hnsw/index.hpp"
+#include "hnsw/index_file.hpp"
+#include "hnsw/memory_region.hpp"
 
 namespace hnsw {
 
@@ -21,8 +24,18 @@ namespace hnsw {
 // layer. A search that runs during inserts sees a valid graph, though maybe not the newest
 // nodes. With several inserting threads the graph differs from run to run, and size() counts
 // nodes whose insert has started, not only finished.
+//
+// Persistence: save() writes the index to one file and load() maps it back in place, so the
+// load takes microseconds and pages come in from disk as searches touch them. A loaded index
+// is read-only: add() throws. Only load files this program wrote. load() checks the header and
+// section sizes but not every link, so a hand-damaged file can still hold out-of-range ids;
+// LoadOptions::verify scans all of them.
 class HnswIndex final : public Index {
 public:
+    struct LoadOptions {
+        bool verify = false;  // also check every link, which reads the whole file
+    };
+
     HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_elements, uint64_t seed);
 
     // Inserts one vector, returns its id.   (Algorithm 1: INSERT)
@@ -39,47 +52,73 @@ public:
     // false = plain M closest (Algorithm 3). Set before adding elements.
     void set_use_heuristic(bool on) { use_heuristic_ = on; }
 
+    // Writes the index to `path` through a temporary file and a rename, so a crash cannot leave
+    // a half-written file under that name. Nothing may call add() while this runs. Throws
+    // std::runtime_error on an I/O failure.
+    void save(const std::string& path) const;
+
+    // Maps a saved index. The result is read-only. Throws std::runtime_error if the file is
+    // missing, damaged, truncated or from an incompatible version.
+    static std::unique_ptr<HnswIndex> load(const std::string& path);
+    static std::unique_ptr<HnswIndex> load(const std::string& path, LoadOptions options);
+
+    bool read_only() const { return read_only_; }
+
 private:
     friend struct HnswTestAccess;  // lets unit tests exercise the storage layer
 
     static constexpr uint32_t kInvalidId = UINT32_MAX;
     static constexpr size_t kLockStripes = 4096;  // power of two
 
-    // One neighbor-list slot. Atomic so searches can read a list while an insert rewrites it.
-    using LinkSlot = std::atomic<uint32_t>;
+    struct LoadTag {};
+    // Wraps a mapped file whose header has already passed index_file::validate.
+    HnswIndex(LoadTag, MemoryRegion mapped, const index_file::Header& header);
 
     size_t dim_;
     size_t M_;
     size_t max_elements_;
     uint64_t seed_;  // levels are a hash of (seed_, id), so they do not depend on thread timing
 
-    std::atomic<size_t> count_{0};      // ids handed out so far
-    std::unique_ptr<float[]> vectors_;  // flat: id * dim_ + j, sized for max_elements_ * dim_
+    std::atomic<size_t> count_{0};  // ids handed out so far
 
     // ---- Graph storage layout (fixed capacity, nothing reallocates or moves) ----
+    //
+    // Each array lives in its own MemoryRegion (an anonymous mmap: zero-filled, and physical
+    // memory is used only for pages that get touched). The raw pointers below point into them.
     //
     // vectors_       id * dim_ + j                       all vectors, flat
     // levels_[id]    top layer of node id (0 = layer 0 only)
     //
     // Layer 0 (every node): one fixed block per node, stride 1 + 2M slots:
-    //     level0_links_[id * (1 + 2M)] = [count, n_0, n_1, ... n_{2M-1}]
-    //   Allocated up front for max_elements_, so it never reallocates.
+    //     level0_[id * (1 + 2M)] = [count, n_0, n_1, ... n_{2M-1}]
     //
-    // Layers >= 1 (only nodes with level > 0): node id owns one allocation holding `level`
-    // blocks of stride 1 + M:
-    //     upper_links_[id][(layer - 1) * (1 + M)] = [count, n_0 ... n_{M-1}]
-    //   upper_links_[id] is null when levels_[id] == 0. About 1 node in M has upper layers.
+    // Layers >= 1 (only nodes with level > 0): upper_offset_[id] is where node id's blocks start
+    // in upper_arena_, in slots (0 = the node has none). A node with level l owns l blocks of
+    // stride 1 + M, back to back:
+    //     upper_arena_[upper_offset_[id] + (layer - 1) * (1 + M)] = [count, n_0 ... n_{M-1}]
+    //   Blocks come from a bump allocator over a fixed-size arena; slot 0 is never handed out.
+    //   About 1 node in M has upper layers, so the arena is small.
     //
     // A block's first slot is the live neighbor count; slots after it are neighbor ids.
+    // Slots are plain uint32_t read and written through std::atomic_ref, so the same bytes can
+    // sit in a file mapping.
     //
-    // Publication: a node's vector, level and link allocation are written before its id is
-    // stored into any neighbor slot. Slots are stored with release and loaded with acquire,
-    // so a thread that reads an id from a slot also sees everything written for that node.
+    // Publication: a node's vector, level and upper offset are written before its id is stored
+    // into any neighbor slot. Slots are stored with release and loaded with acquire, so a thread
+    // that reads an id from a slot also sees everything written for that node.
     size_t ef_construction_;
     double mL_;  // level multiplier, 1 / ln(M)
-    std::unique_ptr<uint8_t[]> levels_;
-    std::unique_ptr<LinkSlot[]> level0_links_;
-    std::vector<std::unique_ptr<LinkSlot[]>> upper_links_;
+    MemoryRegion vectors_region_, levels_region_, level0_region_, upper_offset_region_,
+        upper_arena_region_;
+    MemoryRegion file_region_;  // set instead of the five above when loaded from a file
+    bool read_only_ = false;
+    float* vectors_ = nullptr;
+    uint8_t* levels_ = nullptr;
+    uint32_t* level0_ = nullptr;
+    uint32_t* upper_offset_ = nullptr;
+    uint32_t* upper_arena_ = nullptr;
+    size_t upper_arena_capacity_ = 0;                // slots
+    std::atomic<size_t> upper_arena_used_{1};        // slots handed out; slot 0 stays unused
 
     // Entry node and its layer, packed into one word so a reader always sees a matching pair.
     // Written only while holding entry_mutex_.
@@ -112,14 +151,15 @@ private:
     size_t max_degree(int layer) const { return layer == 0 ? 2 * M_ : M_; }
 
     const float* vector_at(uint32_t id) const {
-        return vectors_.get() + static_cast<size_t>(id) * dim_;
+        return vectors_ + static_cast<size_t>(id) * dim_;
     }
 
     // Takes the next id. Throws std::length_error when the index is full.
     uint32_t reserve_id();
 
     // Writes the vector and level of a reserved id and allocates its upper-layer link blocks.
-    // Layer 0 blocks are already zeroed. Does NOT touch the entry point.
+    // Layer 0 blocks are already zeroed. Does NOT touch the entry point. If the arena is full
+    // it throws and the reserved id stays unused, so treat the index as full.
     void init_node(uint32_t id, const float* vec, int level);
 
     // reserve_id + init_node.
@@ -136,7 +176,12 @@ private:
     // concurrent writers to the same node. For tests.
     void set_neighbors(uint32_t id, int layer, std::span<const uint32_t> ns);
 
-    LinkSlot* link_block(uint32_t id, int layer) const;
+    uint32_t* link_block(uint32_t id, int layer) const;
+
+    // Hands out `slots` consecutive slots from the arena and returns the offset of the first.
+    // Throws std::length_error when the arena is full. The arena is sized at about 8 times
+    // the expected need, so this means a wildly unlucky level sequence.
+    uint32_t alloc_upper(size_t slots);
 
     // Level l = floor(-ln(U) * mL), U in (0, 1] from a hash of (seed_, id); P(level >= l) = M^-l.
     int random_level(uint32_t id) const;
@@ -159,6 +204,12 @@ private:
 
     // add_link for a caller that already holds lock_for(node). Skips ids already in the list.
     void add_link_locked(uint32_t node, uint32_t new_nbr, float dist, int layer);
+
+    // Throws std::runtime_error describing the first structural problem: an entry node that
+    // disagrees with the levels, an upper offset outside the arena, a neighbor count above the
+    // layer's limit, or a link to a missing node, to itself, or to a node not on that layer.
+    // Reads every link. For loaded files.
+    void verify_structure() const;
 
     // Fills a new node's own list on `layer` with `chosen`, merging with any links other
     // threads already added to it.

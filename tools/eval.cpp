@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <sys/resource.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,6 +46,10 @@ void usage() {
         "  --query-repeat R          run the query set R times for timing; recall and latency\n"
         "                            use the first pass only (default 1)\n"
         "  --threads N               build with N threads (hnsw only; default 1)\n"
+        "  --save PATH               after building, save the index to PATH (hnsw only)\n"
+        "  --load PATH               skip the build and map the index saved at PATH. The\n"
+        "                            dataset directory still supplies queries and ground truth\n"
+        "  --verify 0|1              with --load, also check every link (default 0)\n"
         "  --search-threads A[,B,...] query threads; one run + CSV row per (ef, threads) (default 1)\n"
         "  --max-queries N           use only the first N queries (default all)\n"
         "  --csv PATH                append results here (default results/results.csv; 'none' disables)\n",
@@ -58,6 +63,44 @@ std::vector<size_t> parse_list(const std::string& s) {
     return out;
 }
 
+// Peak resident memory of this process so far, in MB. ru_maxrss is bytes on macOS, KB on Linux.
+double peak_rss_mb() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    return static_cast<double>(ru.ru_maxrss) / 1e6;
+#else
+    return static_cast<double>(ru.ru_maxrss) / 1e3;
+#endif
+}
+
+// eval-only side file: the base row each id came from. A parallel build hands out ids in a
+// thread-dependent order, and the saved index does not know about rows.
+std::string rows_path(const std::string& index_path) { return index_path + ".rows"; }
+
+void write_rows(const std::string& index_path, const std::vector<uint32_t>& row_of_id) {
+    std::ofstream f(rows_path(index_path), std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(row_of_id.data()),
+            static_cast<std::streamsize>(row_of_id.size() * sizeof(uint32_t)));
+    if (!f) throw std::runtime_error("cannot write " + rows_path(index_path));
+}
+
+std::vector<uint32_t> read_rows(const std::string& index_path, size_t count) {
+    std::vector<uint32_t> rows(count);
+    std::ifstream f(rows_path(index_path), std::ios::binary);
+    if (!f) {  // no side file: the index was built serially, so id == row
+        for (size_t i = 0; i < count; ++i) rows[i] = static_cast<uint32_t>(i);
+        return rows;
+    }
+    f.read(reinterpret_cast<char*>(rows.data()),
+           static_cast<std::streamsize>(count * sizeof(uint32_t)));
+    if (static_cast<size_t>(f.gcount()) != count * sizeof(uint32_t) || f.peek() != EOF) {
+        throw std::runtime_error(rows_path(index_path) + " does not hold " + std::to_string(count) +
+                                 " rows");
+    }
+    return rows;
+}
+
 double seconds(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double>(b - a).count();
 }
@@ -69,6 +112,7 @@ int main(int argc, char** argv) {
                                               {"M", "16"},            {"ef-construction", "200"},
                                               {"ef-search", "50"},    {"seed", "42"},       {"heuristic", "1"},
                                               {"threads", "1"},       {"search-threads", "1"}, {"query-repeat", "1"},
+                                              {"save", "none"},       {"load", "none"},       {"verify", "0"},
                                               {"max-queries", "0"},   {"csv", "results/results.csv"}};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -93,14 +137,18 @@ int main(int argc, char** argv) {
         const fs::path dir = fs::path(opt["dataset"]);
         std::string name = dir.filename().string();
         if (name.empty()) name = dir.parent_path().filename().string();
-        const auto base = hnsw::load_fvecs((dir / (name + "_base.fvecs")).string());
+        const bool loading = opt["load"] != "none";
+        const bool saving = opt["save"] != "none";
+        if (loading && saving) throw std::runtime_error("use --load or --save, not both");
+        if ((loading || saving) && opt["index"] != "hnsw") {
+            throw std::runtime_error("--load and --save need --index hnsw");
+        }
+        // A loaded index already holds its vectors, so skip reading the base file.
+        hnsw::FvecsData base;
+        if (!loading) base = hnsw::load_fvecs((dir / (name + "_base.fvecs")).string());
         const auto queries = hnsw::load_fvecs((dir / (name + "_query.fvecs")).string());
         const auto gt = hnsw::load_ivecs((dir / (name + "_groundtruth.ivecs")).string());
 
-        if (queries.dim != base.dim) {
-            throw std::runtime_error("query dim " + std::to_string(queries.dim) +
-                                     " != base dim " + std::to_string(base.dim));
-        }
         if (gt.count != queries.count) {
             throw std::runtime_error("ground truth has " + std::to_string(gt.count) +
                                      " rows but there are " + std::to_string(queries.count) +
@@ -120,19 +168,35 @@ int main(int argc, char** argv) {
         const bool is_hnsw = opt["index"] == "hnsw";  // "hnsw-simple" in output = heuristic off
 
         std::unique_ptr<hnsw::Index> index;
-        if (is_hnsw) {
+        hnsw::HnswIndex* hnsw_index = nullptr;
+        double load_s = 0;
+        if (loading) {
+            const auto l0 = Clock::now();
+            auto loaded = hnsw::HnswIndex::load(
+                opt["load"], hnsw::HnswIndex::LoadOptions{.verify = opt["verify"] != "0"});
+            load_s = seconds(l0, Clock::now());
+            hnsw_index = loaded.get();
+            index = std::move(loaded);
+        } else if (is_hnsw) {
             auto h = std::make_unique<hnsw::HnswIndex>(base.dim, M, efc, base.count, seed);
             h->set_use_heuristic(opt["heuristic"] != "0");
+            hnsw_index = h.get();
             index = std::move(h);
         } else if (opt["index"] == "bruteforce") {
             index = std::make_unique<hnsw::BruteForceIndex>(base.dim);
         } else {
             throw std::runtime_error("unknown --index '" + opt["index"] + "'");
         }
+        const size_t n_base = loading ? index->size() : base.count;
+        const size_t index_dim = loading ? index->dim() : base.dim;
+        if (queries.dim != index_dim) {
+            throw std::runtime_error("query dim " + std::to_string(queries.dim) +
+                                     " != index dim " + std::to_string(index_dim));
+        }
         const std::string index_name(index->name());
 
-        std::printf("dataset=%s n=%zu nq=%zu dim=%zu index=%s k=%zu\n", name.c_str(), base.count,
-                    nq, base.dim, index_name.c_str(), k);
+        std::printf("dataset=%s n=%zu nq=%zu dim=%zu index=%s k=%zu\n", name.c_str(), n_base, nq,
+                    index_dim, index_name.c_str(), k);
 
         const size_t threads = std::stoull(opt["threads"]);
         if (threads == 0) throw std::runtime_error("--threads must be >= 1");
@@ -140,7 +204,15 @@ int main(int argc, char** argv) {
 
         // A parallel build hands out ids in a thread-dependent order, but the ground truth
         // names rows of the base file. Remember each id's row and translate results back.
-        std::vector<uint32_t> row_of_id(base.count);
+        std::vector<uint32_t> row_of_id;
+        double build_s = 0;
+        if (loading) {
+            if (threads != 1) throw std::runtime_error("--threads has no effect with --load");
+            row_of_id = read_rows(opt["load"], n_base);
+            std::printf("load_s=%.6f verify=%s peak_rss_mb=%.1f\n", load_s,
+                        opt["verify"] != "0" ? "1" : "0", peak_rss_mb());
+        } else {
+        row_of_id.resize(base.count);
         const auto t0 = Clock::now();
         if (threads == 1) {
             for (size_t i = 0; i < base.count; ++i) {
@@ -167,12 +239,32 @@ int main(int argc, char** argv) {
             for (auto& th : pool) th.join();
             if (failure) std::rethrow_exception(failure);
         }
-        const double build_s = seconds(t0, Clock::now());
+        build_s = seconds(t0, Clock::now());
         std::printf("build_s=%.3f build_threads=%zu\n", build_s, threads);
+        }
+        if (saving) {
+            const auto s0 = Clock::now();
+            hnsw_index->save(opt["save"]);
+            const double save_s = seconds(s0, Clock::now());
+            if (threads > 1) {
+                write_rows(opt["save"], row_of_id);
+            } else {
+                std::remove(rows_path(opt["save"]).c_str());  // ids are rows; drop any stale file
+            }
+            std::printf("save_s=%.3f file_mb=%.1f\n", save_s,
+                        static_cast<double>(fs::file_size(opt["save"])) / 1e6);
+        }
 
         // Exact indexes ignore ef_search, so run them once.
         const std::vector<size_t> efs =
             is_hnsw ? parse_list(opt["ef-search"]) : std::vector<size_t>{0};
+
+        if (loading && nq > 0) {  // the first query pays for the first page faults
+            const auto f0 = Clock::now();
+            index->search(queries.row(0), k, efs.front());
+            std::printf("first_query_us=%.1f\n",
+                        std::chrono::duration<double, std::micro>(Clock::now() - f0).count());
+        }
 
         std::ofstream csv;
         if (opt["csv"] != "none") {
@@ -240,6 +332,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "eval: error: %s\n", e.what());
         return 1;

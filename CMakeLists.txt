@@ -56,7 +56,9 @@ add_library(hnsw
     src/dataset.cpp
     src/brute_force.cpp
     src/metrics.cpp
-    src/hnsw_index.cpp)
+    src/memory_region.cpp
+    src/hnsw_index.cpp
+    src/hnsw_index_io.cpp)
 target_include_directories(hnsw PUBLIC include)
 target_link_libraries(hnsw PRIVATE hnsw_options)
 
