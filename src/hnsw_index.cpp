@@ -13,6 +13,19 @@
 
 namespace hnsw {
 
+namespace {
+
+constexpr size_t kCacheLine = 128;  // Apple Silicon (hw.cachelinesize)
+
+// Asks the CPU to start loading [p, p + bytes) into cache. Never changes results.
+inline void prefetch_bytes(const void* p, size_t bytes) {
+    const char* c = static_cast<const char*>(p);
+    for (size_t off = 0; off < bytes; off += kCacheLine) __builtin_prefetch(c + off);
+    __builtin_prefetch(c + bytes - 1);  // a vector that straddles one more line
+}
+
+}  // namespace
+
 HnswIndex::HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_elements,
                      uint64_t seed)
     : dim_(dim),
@@ -107,7 +120,15 @@ std::vector<Neighbor> HnswIndex::search_layer(const float* query,
         if (results.size() >= ef && c.first > results.top().first) break;
         candidates.pop();
 
-        for (const uint32_t e : neighbors(c.second, layer)) {
+        // Start loading every neighbor's visited tag and vector before using any of them,
+        // so the memory reads overlap instead of running one after another.
+        const std::span<const uint32_t> nbrs = neighbors(c.second, layer);
+        for (const uint32_t e : nbrs) {
+            __builtin_prefetch(&visited_[e]);
+            prefetch_bytes(vector_at(e), dim_ * sizeof(float));
+        }
+
+        for (const uint32_t e : nbrs) {
             if (visited_[e] == epoch_) continue;
             visited_[e] = epoch_;
             const float d = l2_sqr(query, vector_at(e), dim_);

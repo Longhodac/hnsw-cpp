@@ -65,14 +65,14 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 1. Harness: loaders, distance, brute force, recall, eval CLI, plotting, tests. Done.
 2. Single-threaded HNSW. Done.
 3. Parameter tuning of `M`, `efConstruction` and `ef`. Done, results below.
-4. SIMD and profiling. Distance function done (NEON, about 1.8x faster queries). Memory layout and prefetching still open.
+4. SIMD and profiling. NEON distance and prefetching done (about 2.8x faster queries). Heap work and memory layout still open.
 5. Concurrent inserts.
 6. mmap persistence.
 7. FAISS comparison with pybind11 bindings.
 
 ## Phase 4: SIMD distance
 
-Status: the distance function is done. Memory layout and prefetching are not tried yet.
+Status: the NEON distance function and neighbor prefetching are done. The heap work and memory layout are not tried yet.
 
 **What changed.** `include/hnsw/distance.hpp` now has three functions. `l2_sqr_scalar` is the old loop and stays as the reference for tests. `l2_sqr_neon` processes 16 floats per pass with four NEON accumulators and fused multiply-add, then a 4-wide loop, then a scalar loop for leftover elements. `l2_sqr` calls the NEON version on ARM and the scalar version elsewhere.
 
@@ -98,9 +98,30 @@ Status: the distance function is done. Memory layout and prefetching are not tri
 
 The QPS and build rows come from two scalar runs and two NEON runs made back to back with seed 42. Recall@10 was identical to four digits at every `ef`.
 
-**Why 1.8x and not 5x.** Distance took 70.6% of query time. A 5x faster distance would give about 2.3x overall, and the measured gain is 1.8x. The remaining time goes to the rest of the search code, which did not change, and to waiting for vectors to arrive from memory. The profile cannot separate memory waits from arithmetic, so prefetching and memory layout are the next things to try, after a new profile of the NEON build.
+**Why 1.8x and not 5x.** Distance took 70.6% of query time. A 5x faster distance gives about 2.3x overall, and the measured gain was 1.8x. A second profile of the NEON build shows where the rest went.
 
-**How it was checked.** The unit tests compare the NEON and scalar functions for every dimension from 0 to 300 within a relative tolerance of 1e-5, and also cover unaligned pointers and an exact zero for identical vectors. The distance tests pass under AddressSanitizer, which catches reads past the end of an array. Recall at every `ef` matched the scalar build.
+| Function | Before NEON | After NEON |
+|---|---|---|
+| Distance | 70.6% | 37.3% |
+| `search_layer` itself | 25.6% | 53.4% |
+| Heap pop | 3.2% | 7.9% |
+| `malloc` and `free` | 0.1% | 0.4% |
+
+`malloc` and `free` are 0.4%, so reusing the two heaps would gain little. The rest of `search_layer` includes the visited-tag lookups and the neighbor-list reads, which are random reads from memory.
+
+**Prefetching.** `search_layer` now makes one extra pass over a node's neighbors before the distance loop. It asks the CPU to start loading each neighbor's visited tag and vector, so the memory reads overlap instead of running one after another. Results do not change.
+
+| Variant | QPS at recall 0.95 (`ef` 60) | QPS at `ef` 120 | Build |
+|---|---|---|---|
+| No prefetch | 13,800 | 7,900 | 99 s |
+| Prefetch first cache line only | 15,100 | 8,800 | 88 s |
+| Prefetch whole vector | 21,800 | 11,900 | 70 s |
+
+Each row is two runs made back to back at `M=16`, `efC=100`, with identical recall at every `ef`. Prefetching the whole vector is about 1.6x faster at `ef=60`. The first-line version gains only about 10%, because a 512-byte vector spans four or five 128-byte cache lines and the later lines need their own requests. Runs at `ef` of 140 and 160 were noisy in every build, so the table uses lower values.
+
+Together, NEON and prefetch give about 2.8x the QPS at recall 0.95 (7,700 to 21,800) and a 2.4x faster build (170 s to 70 s) compared with the Phase 3 scalar build. I had estimated memory waits at about 16% of query time. Prefetch removed about 37% of it, so the waits were larger than my estimate.
+
+**How it was checked.** The unit tests compare the NEON and scalar functions for every dimension from 0 to 300 within a relative tolerance of 1e-5, and also cover unaligned pointers and an exact zero for identical vectors. The distance tests pass under AddressSanitizer, which catches reads past the end of an array. Recall at every `ef` matched the scalar build, and also matched with and without prefetch. The HNSW tests pass under AddressSanitizer with prefetching on.
 
 ## Benchmark results
 

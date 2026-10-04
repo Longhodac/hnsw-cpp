@@ -20,10 +20,11 @@ When the user explicitly says to "implement" or "build" something, write the com
 - Heuristic ablation (`--heuristic 0`) was not run. Optional follow-up.
 - Phase 4 (SIMD): `l2_sqr` now uses NEON (`l2_sqr_neon`, 4 accumulators, 16 floats per pass); `l2_sqr_scalar` stays as the test reference. Distance call 26.7 ns to 5.3 ns at dim 128. End to end at M=16, efC=100: about 1.8x QPS (13.8K at recall 0.95, 5.9K at 0.99) and build 170 s to 104 s, recall unchanged. Details in the README.
 - Phase 3 QPS figures above were measured with the scalar distance, so they are the pre-Phase-4 baseline.
-- Phase 4 still open: profile the NEON build again, then try prefetching and memory layout if memory waits dominate.
+- Prefetch: `search_layer` prefetches each neighbor's visited tag and whole vector (128-byte lines) before the distance loop. A/B at M=16, efC=100: about 1.6x QPS at ef=60 (13.8K to 21.8K), build 99 s to 70 s, recall identical. Prefetching only the first line gains about 10%. NEON plus prefetch is about 2.8x QPS and 2.4x build speed versus the Phase 3 scalar build.
+- Phase 4 still open: re-profile the prefetch build. Candidates are the heap pop (about 8% before prefetch), the visited-tag layout, and memory layout.
 - Remaining after that: 5 concurrent inserts, 6 mmap persistence, 7 FAISS comparison. See README roadmap.
 
 ## Known limitations to remember
 - `search()` mutates the visited-tag scratch (`visited_`, `epoch_`), so it is not thread-safe; Phase 5 needs per-thread scratch.
-- `search_layer` allocates two heaps per call; revisit when profiling in Phase 4.
+- `search_layer` allocates two heaps per call, but `malloc` and `free` are only about 0.4% of query time, so reusing them gains little.
 - Tests reach private internals through the `HnswTestAccess` friend struct in `tests/hnsw_test_access.hpp`.
