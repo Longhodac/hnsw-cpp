@@ -108,6 +108,10 @@ Interpolated from the measured recall/QPS points, all on SIFT1M, `ef` swept from
 
 The `efConstruction=100` row comes from the first, slower run. The back-to-back rerun in the recommendation above gives 9,100 and 4,000 QPS.
 
+![Recall@10 vs QPS for each M and efConstruction pair on SIFT1M](docs/phase3_recall_qps.png)
+
+Each curve is one graph with `ef` swept along it. A curve that sits further up and to the right is better. The dip in the `M=16, efConstruction=400` curve near recall 0.9 is a noisy run, not a real effect (see Noise).
+
 ### What the sweeps show
 
 - **`ef`.** At `M=16`, `efConstruction=200`, recall rises from 0.71 at `ef=10` to 0.946 at `ef=50` and 0.9956 at `ef=200`. It reaches 0.9993 at `ef=800`. Mean latency grows by about 1.3 µs per unit of `ef`, and p99 stays at 1.3 to 1.5 times the mean.
@@ -126,5 +130,7 @@ The `efConstruction=100` row comes from the first, slower run. The back-to-back 
 
 ```bash
 build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100 --ef-search 10,20,30,40,50,55,60,70,80,100,120,140,160,200,400 --csv results/sweep.csv
-scripts/plot_results.py results/sweep.csv -o results/phase3.png
+scripts/plot_results.py results/sweep.csv -o docs/phase3_recall_qps.png
 ```
+
+The plot lives in `docs/` because `results/` and `*.png` are gitignored. `.gitignore` has an exception for `docs/*.png`.

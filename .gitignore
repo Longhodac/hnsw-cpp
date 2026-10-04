@@ -9,3 +9,4 @@ results/
 compile_commands.json
 .DS_Store
 .vibe-wise
+!docs/*.png
