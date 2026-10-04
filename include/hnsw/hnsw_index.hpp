@@ -45,6 +45,7 @@ public:
     std::vector<Neighbor> search(const float* query, size_t k, size_t ef_search) const override;
 
     size_t size() const override { return count_.load(); }
+    size_t capacity() const { return max_elements_; }  // most nodes this index can hold
     size_t dim() const override { return dim_; }
     std::string_view name() const override { return use_heuristic_ ? "hnsw" : "hnsw-simple"; }
 
