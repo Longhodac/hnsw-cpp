@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #include "hnsw_test_access.hpp"
@@ -116,4 +119,71 @@ TEST(HnswSearchLayer, HandBuiltLineGraph) {
     const auto g = HnswTestAccess::search_layer(idx, &q, {{d0, 0}}, 1, 0);
     ASSERT_EQ(g.size(), 1u);
     EXPECT_EQ(g[0].second, 3u);
+}
+
+TEST(HnswStorage, StorageNeverMovesOnInsert) {
+    HnswIndex idx(2, 4, 10, 64, 1);
+    const float v[] = {1, 2};
+    const auto first = HnswTestAccess::allocate(idx, v, 2);
+    const float* vec_before = HnswTestAccess::vec(idx, first);
+    const uint32_t* nbrs_before[3];
+    for (int l = 0; l <= 2; ++l) nbrs_before[l] = HnswTestAccess::nbrs(idx, first, l).data();
+
+    for (int i = 0; i < 40; ++i) HnswTestAccess::allocate(idx, v, i % 4);  // incl. upper layers
+
+    EXPECT_EQ(HnswTestAccess::vec(idx, first), vec_before);
+    for (int l = 0; l <= 2; ++l) {
+        EXPECT_EQ(HnswTestAccess::nbrs(idx, first, l).data(), nbrs_before[l]) << "layer " << l;
+    }
+}
+
+TEST(HnswStorage, ConcurrentAllocateGivesUniqueDenseIds) {
+    constexpr size_t kThreads = 4, kPerThread = 250;
+    HnswIndex idx(2, 4, 10, kThreads * kPerThread, 1);
+    std::vector<std::vector<uint32_t>> ids(kThreads);
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            const float v[] = {static_cast<float>(t), 0};
+            for (size_t i = 0; i < kPerThread; ++i) {
+                ids[t].push_back(HnswTestAccess::allocate(idx, v, static_cast<int>(i % 3)));
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    std::vector<uint32_t> all;
+    for (const auto& v : ids) all.insert(all.end(), v.begin(), v.end());
+    std::sort(all.begin(), all.end());
+    ASSERT_EQ(all.size(), kThreads * kPerThread);
+    for (size_t i = 0; i < all.size(); ++i) EXPECT_EQ(all[i], i);
+    EXPECT_EQ(idx.size(), kThreads * kPerThread);
+    // Each thread's vectors landed intact in its own slots.
+    for (size_t t = 0; t < kThreads; ++t) {
+        for (const uint32_t id : ids[t]) EXPECT_EQ(HnswTestAccess::vec(idx, id)[0], static_cast<float>(t));
+    }
+}
+
+TEST(HnswStorage, ConcurrentAllocateStopsAtCapacity) {
+    constexpr size_t kThreads = 4, kCap = 100;
+    HnswIndex idx(1, 4, 10, kCap, 1);
+    std::atomic<size_t> ok{0}, full{0};
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            const float v[] = {0};
+            for (int i = 0; i < 100; ++i) {
+                try {
+                    HnswTestAccess::allocate(idx, v, 0);
+                    ++ok;
+                } catch (const std::length_error&) {
+                    ++full;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(ok.load(), kCap);
+    EXPECT_EQ(full.load(), kThreads * 100 - kCap);
+    EXPECT_EQ(idx.size(), kCap);
 }

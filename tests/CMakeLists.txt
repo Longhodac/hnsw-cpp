@@ -5,7 +5,8 @@ add_executable(hnsw_tests
     test_metrics.cpp
     test_hnsw_storage.cpp
     test_hnsw.cpp)
-target_link_libraries(hnsw_tests PRIVATE hnsw hnsw_options GTest::gtest_main)
+find_package(Threads REQUIRED)
+target_link_libraries(hnsw_tests PRIVATE hnsw hnsw_options GTest::gtest_main Threads::Threads)
 target_compile_definitions(hnsw_tests PRIVATE HNSW_DATA_DIR="${PROJECT_SOURCE_DIR}/data")
 
 include(GoogleTest)

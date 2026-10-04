@@ -34,13 +34,13 @@ struct HnswTestAccess {
     static void validate(const HnswIndex& i) {
         ASSERT_NE(i.entry_point_, HnswIndex::kInvalidId);
         EXPECT_EQ(i.levels_[i.entry_point_], i.max_level_);
-        for (uint32_t id = 0; id < i.count_; ++id) {
+        for (uint32_t id = 0; id < i.count_.load(); ++id) {
             EXPECT_LE(i.levels_[id], i.max_level_);
             for (int l = 0; l <= i.levels_[id]; ++l) {
                 const auto ns = i.neighbors(id, l);
                 EXPECT_LE(ns.size(), i.max_degree(l)) << "node " << id << " layer " << l;
                 for (size_t a = 0; a < ns.size(); ++a) {
-                    EXPECT_LT(ns[a], i.count_);
+                    EXPECT_LT(ns[a], i.count_.load());
                     EXPECT_NE(ns[a], id) << "self loop at " << id;
                     EXPECT_GE(i.levels_[ns[a]], l) << "neighbor not present on layer " << l;
                     for (size_t b = a + 1; b < ns.size(); ++b) EXPECT_NE(ns[a], ns[b]);

@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <set>
+#include <thread>
+#include <vector>
 
 #include "hnsw/brute_force.hpp"
 #include "hnsw/dataset.hpp"
@@ -154,5 +157,67 @@ TEST(Hnsw, SiftSmallRecall) {
             for (auto& [d, id] : idx.search(query.row(q), 10, 100)) res[q].push_back(id);
         }
         EXPECT_GE(hnsw::recall_at_k(res, gt, 10), 0.95) << "heuristic=" << heuristic;
+    }
+}
+
+namespace {
+
+std::unique_ptr<HnswIndex> build_index(const std::vector<float>& base, size_t dim,
+                                       uint64_t seed) {
+    auto idx = std::make_unique<HnswIndex>(dim, 12, 100, base.size() / dim, seed);
+    for (size_t i = 0; i < base.size() / dim; ++i) idx->add(&base[i * dim]);
+    return idx;
+}
+
+using Results = std::vector<std::vector<hnsw::Neighbor>>;
+
+Results run_queries(const HnswIndex& idx, const std::vector<float>& queries, size_t dim, size_t k,
+                    size_t ef) {
+    Results out;
+    for (size_t q = 0; q < queries.size() / dim; ++q) {
+        out.push_back(idx.search(&queries[q * dim], k, ef));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(HnswConcurrency, ParallelSearchMatchesSerial) {
+    const size_t n = 3000, dim = 16, k = 10, ef = 60;
+    const auto base = random_vectors(n, dim, 3);
+    const auto queries = random_vectors(200, dim, 4);
+    const auto built = build_index(base, dim, 42);
+    const HnswIndex& idx = *built;
+    const Results serial = run_queries(idx, queries, dim, k, ef);
+
+    constexpr size_t kThreads = 4;
+    std::vector<Results> got(kThreads);
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int round = 0; round < 3; ++round) got[t] = run_queries(idx, queries, dim, k, ef);
+        });
+    }
+    for (auto& th : threads) th.join();
+    for (size_t t = 0; t < kThreads; ++t) EXPECT_EQ(got[t], serial) << "thread " << t;
+}
+
+TEST(HnswConcurrency, TwoIndexesOnOneThreadDoNotInterfere) {
+    const size_t dim = 8, k = 5, ef = 40;
+    const auto base_a = random_vectors(500, dim, 5);
+    const auto base_b = random_vectors(800, dim, 6);  // different size forces a scratch reset
+    const auto queries = random_vectors(50, dim, 7);
+    const auto built_a = build_index(base_a, dim, 1);
+    const auto built_b = build_index(base_b, dim, 2);
+    const HnswIndex& a = *built_a;
+    const HnswIndex& b = *built_b;
+    const Results want_a = run_queries(a, queries, dim, k, ef);
+    const Results want_b = run_queries(b, queries, dim, k, ef);
+
+    for (int round = 0; round < 3; ++round) {  // alternate on this thread
+        for (size_t q = 0; q < queries.size() / dim; ++q) {
+            EXPECT_EQ(a.search(&queries[q * dim], k, ef), want_a[q]);
+            EXPECT_EQ(b.search(&queries[q * dim], k, ef), want_b[q]);
+        }
     }
 }

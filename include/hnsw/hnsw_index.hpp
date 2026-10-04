@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <span>
 #include <vector>
@@ -13,8 +15,8 @@ namespace hnsw {
 // Malkov & Yashunin, "Efficient and robust approximate nearest neighbor search using
 // Hierarchical Navigable Small World graphs" (arXiv:1603.09320).
 //
-// Single-threaded: search() mutates internal scratch state (visited tags), so even
-// concurrent searches are not yet safe (Phase 5).
+// search() is safe to call from many threads at once: each thread keeps its own visited-tag
+// scratch. add() is still single-threaded until the locks land (Phase 5c).
 class HnswIndex final : public Index {
 public:
     HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_elements, uint64_t seed);
@@ -25,7 +27,7 @@ public:
     // k-NN query, sorted by ascending distance.   (Algorithm 5: K-NN-SEARCH)
     std::vector<Neighbor> search(const float* query, size_t k, size_t ef_search) const override;
 
-    size_t size() const override { return count_; }
+    size_t size() const override { return count_.load(); }
     size_t dim() const override { return dim_; }
     std::string_view name() const override { return use_heuristic_ ? "hnsw" : "hnsw-simple"; }
 
@@ -43,10 +45,10 @@ private:
     size_t max_elements_;
     std::mt19937_64 rng_;  // for random level assignment
 
-    size_t count_ = 0;
-    std::vector<float> vectors_;  // flat: id * dim_ + j (reserved for max_elements_ * dim_)
+    std::atomic<size_t> count_{0};      // ids handed out so far
+    std::unique_ptr<float[]> vectors_;  // flat: id * dim_ + j, sized for max_elements_ * dim_
 
-    // ---- Graph storage layout (fixed capacity, no per-node heap allocations) ----
+    // ---- Graph storage layout (fixed capacity, nothing reallocates or moves) ----
     //
     // vectors_       id * dim_ + j                       all vectors, flat
     // levels_[id]    top layer of node id (0 = layer 0 only)
@@ -55,26 +57,20 @@ private:
     //     level0_links_[id * (1 + 2M)] = [count, n_0, n_1, ... n_{2M-1}]
     //   Allocated up front for max_elements_, so it never reallocates.
     //
-    // Layers >= 1 (only nodes with level > 0): a node with level l owns l blocks of
-    // stride 1 + M, stored contiguously and appended to upper_links_ on insertion:
-    //     upper_links_[upper_offset_[id] + (layer - 1) * (1 + M)] = [count, n_0 ... n_{M-1}]
-    //   upper_offset_[id] is only meaningful when levels_[id] > 0.
+    // Layers >= 1 (only nodes with level > 0): node id owns one allocation holding `level`
+    // blocks of stride 1 + M:
+    //     upper_links_[id][(layer - 1) * (1 + M)] = [count, n_0 ... n_{M-1}]
+    //   upper_links_[id] is null when levels_[id] == 0. About 1 node in M has upper layers.
     //
     // A block's first slot is the live neighbor count; slots after it are neighbor ids.
     size_t ef_construction_;
     double mL_;                          // level multiplier, 1 / ln(M)
-    std::vector<uint8_t> levels_;
+    std::unique_ptr<uint8_t[]> levels_;
     std::vector<uint32_t> level0_links_;
-    std::vector<size_t> upper_offset_;
-    std::vector<uint32_t> upper_links_;
+    std::vector<std::unique_ptr<uint32_t[]>> upper_links_;
     uint32_t entry_point_ = kInvalidId;  // id of the top-layer entry node
     int max_level_ = -1;                 // top layer currently in the graph (-1 = empty)
     bool use_heuristic_ = true;
-
-    // Visited-set scratch for search_layer: visited_[id] == epoch_ means "seen this call".
-    // Bumping epoch_ resets the whole set in O(1).
-    mutable std::vector<uint32_t> visited_;
-    mutable uint32_t epoch_ = 0;
 
     // Keep candidates rejected by the heuristic to fill up to M (paper's
     // keepPrunedConnections). Off, matching hnswlib's default.
@@ -83,10 +79,13 @@ private:
     // Max neighbors per node on a layer: 2M on layer 0, M above (Mmax0 / Mmax in the paper).
     size_t max_degree(int layer) const { return layer == 0 ? 2 * M_ : M_; }
 
-    const float* vector_at(uint32_t id) const { return vectors_.data() + id * dim_; }
+    const float* vector_at(uint32_t id) const {
+        return vectors_.get() + static_cast<size_t>(id) * dim_;
+    }
 
-    // Reserves storage for a new node: copies the vector, records its level, and
-    // zero-initializes its link blocks on layers 0..level. Returns the new id.
+    // Reserves storage for a new node: takes the next id atomically, copies the vector,
+    // records its level, and allocates zeroed link blocks on layers 1..level (layer 0 is
+    // already zeroed). Returns the new id.
     // Throws std::length_error when the index is full. Does NOT touch the entry point.
     uint32_t allocate_node(const float* vec, int level);
 
@@ -101,8 +100,6 @@ private:
 
     // Level l = floor(-ln(U) * mL), U ~ uniform(0, 1]; P(level >= l) = M^-l.
     int random_level();
-
-    void next_epoch() const;
 
     // Algorithm 2. Best-first search on one layer from the given entry points; returns
     // the (up to) ef closest nodes found, sorted by ascending distance.

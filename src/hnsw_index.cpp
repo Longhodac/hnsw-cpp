@@ -24,6 +24,30 @@ inline void prefetch_bytes(const void* p, size_t bytes) {
     __builtin_prefetch(c + bytes - 1);  // a vector that straddles one more line
 }
 
+// Visited-set scratch for search_layer, one per thread. tags[id] == epoch means "seen in this
+// call". Bumping epoch resets the whole set in O(1). The tags are tied to one index; a thread
+// that switches to another index (or an index of another size) pays one O(max_elements) reset.
+// A new index reusing an old address is safe: epoch only grows, so stale tags never match.
+struct VisitedScratch {
+    std::vector<uint32_t> tags;
+    uint32_t epoch = 0;
+    const void* owner = nullptr;
+
+    void begin(const void* index, size_t n) {
+        if (owner != index || tags.size() != n) {
+            tags.assign(n, 0);
+            epoch = 0;
+            owner = index;
+        }
+        if (++epoch == 0) {  // wrapped: stale tags could alias the new epoch
+            std::fill(tags.begin(), tags.end(), 0u);
+            epoch = 1;
+        }
+    }
+};
+
+thread_local VisitedScratch tls_visited;
+
 }  // namespace
 
 HnswIndex::HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_elements,
@@ -33,37 +57,42 @@ HnswIndex::HnswIndex(size_t dim, size_t M, size_t ef_construction, size_t max_el
       max_elements_(max_elements),
       rng_(seed),
       ef_construction_(ef_construction),
-      mL_(M >= 2 ? 1.0 / std::log(static_cast<double>(M)) : 0.0),
-      visited_(max_elements, 0) {
+      mL_(M >= 2 ? 1.0 / std::log(static_cast<double>(M)) : 0.0) {
     if (dim == 0) throw std::invalid_argument("HnswIndex: dim must be > 0");
     if (M < 2) throw std::invalid_argument("HnswIndex: M must be >= 2");
     if (max_elements >= kInvalidId) {
         throw std::invalid_argument("HnswIndex: max_elements must fit in uint32_t ids");
     }
-    vectors_.reserve(max_elements * dim);
-    levels_.reserve(max_elements);
-    upper_offset_.reserve(max_elements);
+    // Everything is sized once, so no later insert reallocates or moves data other threads read.
+    vectors_ = std::make_unique_for_overwrite<float[]>(max_elements * dim);  // pages fault in lazily
+    levels_ = std::make_unique<uint8_t[]>(max_elements);
     level0_links_.assign(max_elements * (1 + 2 * M), 0);  // counts start at 0 = no neighbors
+    upper_links_.resize(max_elements);
 }
 
 uint32_t HnswIndex::allocate_node(const float* vec, int level) {
-    if (count_ >= max_elements_) throw std::length_error("HnswIndex: max_elements reached");
     if (level < 0 || level > std::numeric_limits<uint8_t>::max()) {
         throw std::invalid_argument("HnswIndex: level out of range");
     }
-    const auto id = static_cast<uint32_t>(count_++);
-    vectors_.insert(vectors_.end(), vec, vec + dim_);
-    levels_.push_back(static_cast<uint8_t>(level));
-    upper_offset_.push_back(upper_links_.size());
-    // One zeroed block (count + M slots) per layer 1..level.
-    upper_links_.resize(upper_links_.size() + static_cast<size_t>(level) * (1 + M_), 0);
+    size_t next = count_.load(std::memory_order_relaxed);
+    do {
+        if (next >= max_elements_) throw std::length_error("HnswIndex: max_elements reached");
+    } while (!count_.compare_exchange_weak(next, next + 1, std::memory_order_relaxed));
+
+    const auto id = static_cast<uint32_t>(next);
+    std::copy(vec, vec + dim_, vectors_.get() + static_cast<size_t>(id) * dim_);
+    levels_[id] = static_cast<uint8_t>(level);
+    if (level > 0) {
+        // One zeroed block (count + M slots) per layer 1..level.
+        upper_links_[id] = std::make_unique<uint32_t[]>(static_cast<size_t>(level) * (1 + M_));
+    }
     return id;
 }
 
 const uint32_t* HnswIndex::link_block(uint32_t id, int layer) const {
     assert(id < count_ && layer >= 0 && layer <= levels_[id]);
     if (layer == 0) return level0_links_.data() + static_cast<size_t>(id) * (1 + 2 * M_);
-    return upper_links_.data() + upper_offset_[id] + static_cast<size_t>(layer - 1) * (1 + M_);
+    return upper_links_[id].get() + static_cast<size_t>(layer - 1) * (1 + M_);
 }
 
 uint32_t* HnswIndex::link_block(uint32_t id, int layer) {
@@ -89,25 +118,21 @@ int HnswIndex::random_level() {
     return static_cast<int>(std::min(level, 255.0));
 }
 
-void HnswIndex::next_epoch() const {
-    if (++epoch_ == 0) {  // wrapped: stale tags could alias the new epoch
-        std::fill(visited_.begin(), visited_.end(), 0u);
-        epoch_ = 1;
-    }
-}
-
 std::vector<Neighbor> HnswIndex::search_layer(const float* query,
                                               std::span<const Neighbor> entry_points, size_t ef,
                                               int layer) const {
-    next_epoch();
+    VisitedScratch& vis = tls_visited;
+    vis.begin(this, max_elements_);
+    uint32_t* const tags = vis.tags.data();
+    const uint32_t epoch = vis.epoch;
     // candidates: min-heap, nearest first to expand. results: max-heap of the best ef,
     // furthest on top so it can be evicted.
     std::priority_queue<Neighbor, std::vector<Neighbor>, std::greater<>> candidates;
     std::priority_queue<Neighbor> results;
 
     for (const Neighbor& ep : entry_points) {
-        if (visited_[ep.second] == epoch_) continue;
-        visited_[ep.second] = epoch_;
+        if (tags[ep.second] == epoch) continue;
+        tags[ep.second] = epoch;
         candidates.push(ep);
         results.push(ep);
         if (results.size() > ef) results.pop();
@@ -124,13 +149,13 @@ std::vector<Neighbor> HnswIndex::search_layer(const float* query,
         // so the memory reads overlap instead of running one after another.
         const std::span<const uint32_t> nbrs = neighbors(c.second, layer);
         for (const uint32_t e : nbrs) {
-            __builtin_prefetch(&visited_[e]);
+            __builtin_prefetch(&tags[e]);
             prefetch_bytes(vector_at(e), dim_ * sizeof(float));
         }
 
         for (const uint32_t e : nbrs) {
-            if (visited_[e] == epoch_) continue;
-            visited_[e] = epoch_;
+            if (tags[e] == epoch) continue;
+            tags[e] = epoch;
             const float d = l2_sqr(query, vector_at(e), dim_);
             if (results.size() < ef || d < results.top().first) {
                 candidates.emplace(d, e);

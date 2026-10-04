@@ -22,9 +22,11 @@ When the user explicitly says to "implement" or "build" something, write the com
 - Phase 3 QPS figures above were measured with the scalar distance, so they are the pre-Phase-4 baseline.
 - Prefetch: `search_layer` prefetches each neighbor's visited tag and whole vector (128-byte lines) before the distance loop. A/B at M=16, efC=100: about 1.6x QPS at ef=60 (13.8K to 21.8K), build 99 s to 70 s, recall identical. Prefetching only the first line gains about 10%. NEON plus prefetch is about 2.8x QPS and 2.4x build speed versus the Phase 3 scalar build.
 - Phase 4 still open: re-profile the prefetch build. Candidates are the heap pop (about 8% before prefetch), the visited-tag layout, and memory layout.
-- Remaining after that: 5 concurrent inserts, 6 mmap persistence, 7 FAISS comparison. See README roadmap.
+- Phase 5 plan (agreed): 5a per-thread search scratch (done), 5b preallocated storage and atomic id counter (done), 5c per-node-striped locks (4096 mutexes by id) with atomic neighbor slots for lock-free readers, global mutex for entry point and top level only when a new top level appears, level from hash(seed, id), 5d mixed search-while-add stress test under TSan, 5e `eval --threads N` scaling. Each step ends in a check. 5a and 5b: 45 tests pass, ASan clean, TSan clean on the concurrency tests, single-thread QPS and recall unchanged.
+- `HnswIndex` is neither copyable nor movable now (atomic counter). Build it with `make_unique` or in place.
+- Remaining after that: 6 mmap persistence, 7 FAISS comparison. See README roadmap.
 
 ## Known limitations to remember
-- `search()` mutates the visited-tag scratch (`visited_`, `epoch_`), so it is not thread-safe; Phase 5 needs per-thread scratch.
+- `search()` is thread-safe (per-thread `thread_local` visited scratch, Phase 5a). `add()` is NOT thread-safe yet: neighbor lists are rewritten in place and `entry_point_`, `max_level_` and `rng_` are shared. Phase 5c adds locks and atomic neighbor slots.
 - `search_layer` allocates two heaps per call, but `malloc` and `free` are only about 0.4% of query time, so reusing them gains little.
 - Tests reach private internals through the `HnswTestAccess` friend struct in `tests/hnsw_test_access.hpp`.
