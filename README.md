@@ -66,7 +66,7 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 2. Single-threaded HNSW. Done.
 3. Parameter tuning of `M`, `efConstruction` and `ef`. Done, results below.
 4. SIMD and profiling. NEON distance and prefetching done (about 2.8x faster queries). Heap work and memory layout still open.
-5. Concurrent inserts. Steps 5a (per-thread search scratch) and 5b (preallocated storage) done. Locks in `add` are next.
+5. Concurrent inserts. Per-thread search scratch, preallocated storage and locked, atomic-slot `add` are done and pass TSan. `eval --threads N` and the scaling measurement are next.
 6. mmap persistence.
 7. FAISS comparison with pybind11 bindings.
 

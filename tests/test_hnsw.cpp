@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <random>
@@ -219,5 +220,143 @@ TEST(HnswConcurrency, TwoIndexesOnOneThreadDoNotInterfere) {
             EXPECT_EQ(a.search(&queries[q * dim], k, ef), want_a[q]);
             EXPECT_EQ(b.search(&queries[q * dim], k, ef), want_b[q]);
         }
+    }
+}
+
+namespace {
+
+// Vectors of `idx` in id order, so exact search runs over exactly what the index holds
+// (a parallel build assigns ids in a thread-dependent order).
+std::vector<float> stored_vectors(const HnswIndex& idx, size_t dim) {
+    std::vector<float> out(idx.size() * dim);
+    for (uint32_t id = 0; id < idx.size(); ++id) {
+        std::copy_n(HnswTestAccess::vec(idx, id), dim, out.begin() + static_cast<long>(id * dim));
+    }
+    return out;
+}
+
+void add_in_parallel(HnswIndex& idx, const std::vector<float>& base, size_t dim, size_t threads) {
+    const size_t n = base.size() / dim;
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < threads; ++t) {
+        pool.emplace_back([&, t] {
+            for (size_t i = t; i < n; i += threads) idx.add(&base[i * dim]);
+        });
+    }
+    for (auto& th : pool) th.join();
+}
+
+}  // namespace
+
+TEST(HnswConcurrency, ParallelBuildProducesValidGraph) {
+    const size_t n = 3000, dim = 16;
+    const auto base = random_vectors(n, dim, 11);
+    const auto queries = random_vectors(100, dim, 12);
+
+    HnswIndex serial(dim, 12, 100, n, 42);
+    for (size_t i = 0; i < n; ++i) serial.add(&base[i * dim]);
+    const double serial_recall = recall_vs_exact(serial, base, dim, queries, 10, 100);
+
+    HnswIndex parallel(dim, 12, 100, n, 42);
+    add_in_parallel(parallel, base, dim, 4);
+    ASSERT_EQ(parallel.size(), n);
+    HnswTestAccess::validate(parallel);
+    const double parallel_recall =
+        recall_vs_exact(parallel, stored_vectors(parallel, dim), dim, queries, 10, 100);
+    EXPECT_GT(parallel_recall, 0.9);
+    EXPECT_GT(parallel_recall, serial_recall - 0.05);
+}
+
+TEST(HnswConcurrency, FrequentTopLevelChangesStayValid) {
+    // M=3 gives many layers, so inserts often raise the top layer and fight for entry_mutex_.
+    const size_t n = 2000, dim = 8;
+    const auto base = random_vectors(n, dim, 13);
+    HnswIndex idx(dim, 3, 60, n, 5);
+    add_in_parallel(idx, base, dim, 8);
+    ASSERT_EQ(idx.size(), n);
+    HnswTestAccess::validate(idx);
+    EXPECT_GE(HnswTestAccess::max_level(idx), 3);
+    const auto r = idx.search(&base[0], 5, 50);
+    EXPECT_EQ(r.size(), 5u);
+}
+
+TEST(HnswConcurrency, SearchWhileAdding) {
+    const size_t preload = 500, total = 2000, dim = 12, k = 10;
+    const auto base = random_vectors(total, dim, 21);
+    const auto queries = random_vectors(64, dim, 22);
+    HnswIndex idx(dim, 8, 80, total, 9);
+    for (size_t i = 0; i < preload; ++i) idx.add(&base[i * dim]);
+
+    std::atomic<bool> writers_done{false};
+    std::atomic<size_t> bad{0}, searches{0};
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < 2; ++t) {
+        pool.emplace_back([&, t] {  // two writers split the remaining vectors
+            for (size_t i = preload + t; i < total; i += 2) idx.add(&base[i * dim]);
+        });
+    }
+    std::vector<std::thread> readers;
+    for (size_t t = 0; t < 2; ++t) {
+        readers.emplace_back([&, t] {
+            size_t q = t;
+            while (!writers_done.load()) {
+                const auto r = idx.search(&queries[(q % 64) * dim], k, 40);
+                ++q;
+                ++searches;
+                std::set<uint32_t> seen;
+                for (size_t i = 0; i < r.size(); ++i) {
+                    if (r[i].second >= total || !seen.insert(r[i].second).second) ++bad;
+                    if (i > 0 && r[i].first < r[i - 1].first) ++bad;
+                }
+                if (r.empty() || r.size() > k) ++bad;
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    writers_done = true;
+    for (auto& th : readers) th.join();
+
+    EXPECT_EQ(bad.load(), 0u);
+    EXPECT_GT(searches.load(), 0u);
+    ASSERT_EQ(idx.size(), total);
+    HnswTestAccess::validate(idx);
+}
+
+TEST(HnswConcurrency, ParallelAddStopsAtCapacity) {
+    const size_t cap = 400, dim = 4, threads = 4;
+    const auto base = random_vectors(cap, dim, 31);
+    HnswIndex idx(dim, 6, 40, cap, 3);
+    std::atomic<size_t> ok{0}, full{0};
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < threads; ++t) {
+        pool.emplace_back([&] {
+            for (size_t i = 0; i < cap / 2; ++i) {  // 4 * 200 attempts for 400 slots
+                try {
+                    idx.add(&base[(i % cap) * dim]);
+                    ++ok;
+                } catch (const std::length_error&) {
+                    ++full;
+                }
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    EXPECT_EQ(ok.load(), cap);
+    EXPECT_EQ(full.load(), threads * (cap / 2) - cap);
+    ASSERT_EQ(idx.size(), cap);
+    HnswTestAccess::validate(idx);
+}
+
+TEST(HnswConcurrency, ManySmallParallelBuildsStayValid) {
+    // Small dense graphs with many threads make inserts collide most often: threads find each
+    // other's half-linked nodes, including a node reaching itself through a newer neighbor.
+    const size_t n = 200, dim = 4;
+    for (uint64_t round = 0; round < 40; ++round) {
+        const auto base = random_vectors(n, dim, static_cast<uint32_t>(100 + round));
+        HnswIndex idx(dim, 4, 30, n, round);
+        add_in_parallel(idx, base, dim, 8);
+        ASSERT_EQ(idx.size(), n) << "round " << round;
+        HnswTestAccess::validate(idx);
+        if (::testing::Test::HasFailure()) FAIL() << "invalid graph in round " << round;
     }
 }

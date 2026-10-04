@@ -75,9 +75,20 @@ TEST(HnswStorage, RejectsBadParams) {
 
 TEST(HnswLevels, DeterministicForSeed) {
     HnswIndex a(2, 16, 10, 8, 7), b(2, 16, 10, 8, 7);
-    for (int i = 0; i < 1000; ++i) {
-        EXPECT_EQ(HnswTestAccess::random_level(a), HnswTestAccess::random_level(b));
+    for (uint32_t id = 0; id < 1000; ++id) {
+        EXPECT_EQ(HnswTestAccess::random_level(a, id), HnswTestAccess::random_level(b, id));
     }
+}
+
+TEST(HnswLevels, DependOnlyOnSeedAndId) {
+    HnswIndex a(2, 16, 10, 8, 7), c(2, 16, 10, 8, 8);
+    int differing = 0;
+    for (uint32_t id = 0; id < 5000; ++id) {
+        // Same answer on a repeat call: no hidden generator state.
+        EXPECT_EQ(HnswTestAccess::random_level(a, id), HnswTestAccess::random_level(a, id));
+        differing += HnswTestAccess::random_level(a, id) != HnswTestAccess::random_level(c, id);
+    }
+    EXPECT_GT(differing, 0);  // a different seed gives a different level sequence
 }
 
 TEST(HnswLevels, GeometricDistribution) {
@@ -85,7 +96,9 @@ TEST(HnswLevels, GeometricDistribution) {
     HnswIndex idx(2, M, 10, 8, 123);
     const int n = 200000;
     std::vector<int> hist(32, 0);
-    for (int i = 0; i < n; ++i) ++hist[std::min(HnswTestAccess::random_level(idx), 31)];
+    for (int i = 0; i < n; ++i) {
+        ++hist[std::min(HnswTestAccess::random_level(idx, static_cast<uint32_t>(i)), 31)];
+    }
 
     // P(level >= l) = M^-l.
     int at_least_1 = n - hist[0];
@@ -126,14 +139,14 @@ TEST(HnswStorage, StorageNeverMovesOnInsert) {
     const float v[] = {1, 2};
     const auto first = HnswTestAccess::allocate(idx, v, 2);
     const float* vec_before = HnswTestAccess::vec(idx, first);
-    const uint32_t* nbrs_before[3];
-    for (int l = 0; l <= 2; ++l) nbrs_before[l] = HnswTestAccess::nbrs(idx, first, l).data();
+    const void* links_before[3];
+    for (int l = 0; l <= 2; ++l) links_before[l] = HnswTestAccess::link_ptr(idx, first, l);
 
     for (int i = 0; i < 40; ++i) HnswTestAccess::allocate(idx, v, i % 4);  // incl. upper layers
 
     EXPECT_EQ(HnswTestAccess::vec(idx, first), vec_before);
     for (int l = 0; l <= 2; ++l) {
-        EXPECT_EQ(HnswTestAccess::nbrs(idx, first, l).data(), nbrs_before[l]) << "layer " << l;
+        EXPECT_EQ(HnswTestAccess::link_ptr(idx, first, l), links_before[l]) << "layer " << l;
     }
 }
 
@@ -186,4 +199,16 @@ TEST(HnswStorage, ConcurrentAllocateStopsAtCapacity) {
     EXPECT_EQ(ok.load(), kCap);
     EXPECT_EQ(full.load(), kThreads * 100 - kCap);
     EXPECT_EQ(idx.size(), kCap);
+}
+
+TEST(HnswStorage, AddLinkRefusesSelfLinksAndDuplicates) {
+    HnswIndex idx(1, 4, 10, 8, 1);
+    const float v[] = {0};
+    HnswTestAccess::allocate(idx, v, 0);
+    HnswTestAccess::allocate(idx, v, 0);
+    HnswTestAccess::add_link(idx, 0, 0, 0.f, 0);  // self link: ignored
+    EXPECT_TRUE(HnswTestAccess::nbrs(idx, 0, 0).empty());
+    HnswTestAccess::add_link(idx, 0, 1, 1.f, 0);
+    HnswTestAccess::add_link(idx, 0, 1, 1.f, 0);  // duplicate: ignored
+    EXPECT_EQ(HnswTestAccess::nbrs(idx, 0, 0), std::vector<uint32_t>{1});
 }

@@ -10,4 +10,4 @@ target_link_libraries(hnsw_tests PRIVATE hnsw hnsw_options GTest::gtest_main Thr
 target_compile_definitions(hnsw_tests PRIVATE HNSW_DATA_DIR="${PROJECT_SOURCE_DIR}/data")
 
 include(GoogleTest)
-gtest_discover_tests(hnsw_tests DISCOVERY_MODE PRE_TEST)
+gtest_discover_tests(hnsw_tests DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 300)
