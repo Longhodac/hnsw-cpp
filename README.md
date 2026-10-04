@@ -70,6 +70,28 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 6. mmap persistence.
 7. FAISS comparison with pybind11 bindings.
 
+## Phase 4: how SIMD speeds this up
+
+Status: not started. The Phase 3 numbers below are the baseline to beat.
+
+**The cost.** Every query and every insert computes many squared L2 distances between 128-float vectors. `l2_sqr` does this with a plain loop that handles one float per step.
+
+**What SIMD does.** SIMD means one instruction works on several numbers at once. An Apple Silicon CPU has NEON registers that hold 4 floats. One instruction subtracts 4 pairs, and one fused multiply-add squares and accumulates them. A distance over 128 floats takes about 32 vector steps instead of 128 scalar steps.
+
+**Why the compiler does not do it alone.** Floating-point addition gives slightly different results when the order changes, so the compiler keeps the order of the loop unless told otherwise. A hand-written version keeps several partial sums in separate registers and adds them at the end. Its distances can differ from the scalar version in the last digits. The unit tests will compare the two within a tolerance, and `eval` will confirm that recall stays the same.
+
+**Why the speedup will be smaller than 4x.**
+- Distance is only part of the work. If it takes 60% of the time and gets 4 times faster, the whole run gets about 1.8 times faster.
+- The 1M vectors take about 512 MB, and each graph hop reads a random spot in memory. If the CPU waits on those reads, faster arithmetic helps less.
+
+**Plan.**
+1. Profile the release build with Instruments (Time Profiler) to see how much time `l2_sqr` and memory waits take. Build with debug symbols and optimizations on, because `l2_sqr` is inlined and its samples may appear under `search_layer`.
+2. Write a NEON `l2_sqr`, keep the scalar version as the reference, and handle dimensions that are not a multiple of 4.
+3. Compare with `bench_distance`, then rerun the full `eval` sweep against the Phase 3 baseline.
+4. If the profile shows memory waits, try aligned vectors and prefetching the next neighbor's vector, and measure again.
+
+**Done when.** Recall@10 matches the baseline to within about 0.0003, and QPS and build time improve by more than the run-to-run noise (about 15%). Before-and-after numbers will go in this README and in `CLAUDE.md`.
+
 ## Benchmark results
 
 ### Setup
