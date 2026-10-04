@@ -65,32 +65,42 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 1. Harness: loaders, distance, brute force, recall, eval CLI, plotting, tests. Done.
 2. Single-threaded HNSW. Done.
 3. Parameter tuning of `M`, `efConstruction` and `ef`. Done, results below.
-4. SIMD and profiling.
+4. SIMD and profiling. Distance function done (NEON, about 1.8x faster queries). Memory layout and prefetching still open.
 5. Concurrent inserts.
 6. mmap persistence.
 7. FAISS comparison with pybind11 bindings.
 
-## Phase 4: how SIMD speeds this up
+## Phase 4: SIMD distance
 
-Status: not started. The Phase 3 numbers below are the baseline to beat.
+Status: the distance function is done. Memory layout and prefetching are not tried yet.
 
-**The cost.** Every query and every insert computes many squared L2 distances between 128-float vectors. `l2_sqr` does this with a plain loop that handles one float per step.
+**What changed.** `include/hnsw/distance.hpp` now has three functions. `l2_sqr_scalar` is the old loop and stays as the reference for tests. `l2_sqr_neon` processes 16 floats per pass with four NEON accumulators and fused multiply-add, then a 4-wide loop, then a scalar loop for leftover elements. `l2_sqr` calls the NEON version on ARM and the scalar version elsewhere.
 
-**What SIMD does.** SIMD means one instruction works on several numbers at once. An Apple Silicon CPU has NEON registers that hold 4 floats. One instruction subtracts 4 pairs, and one fused multiply-add squares and accumulates them. A distance over 128 floats takes about 32 vector steps instead of 128 scalar steps.
+**Why it is faster.** SIMD means one instruction works on several numbers at once, and a NEON register holds 4 floats. At `-O3` the compiler already did the subtract and square with NEON, but it then added the 16 results one at a time in a single chain, because floating-point addition must keep its order. Each add waited for the one before it. The NEON version keeps four independent sums and combines them once at the end, so the adds overlap. Its distances can differ from the scalar version in the last digits.
 
-**Why the compiler does not do it alone.** Floating-point addition gives slightly different results when the order changes, so the compiler keeps the order of the loop unless told otherwise. A hand-written version keeps several partial sums in separate registers and adds them at the end. Its distances can differ from the scalar version in the last digits. The unit tests will compare the two within a tolerance, and `eval` will confirm that recall stays the same.
+**Profile before the change.** A 20-second sample of queries at `M=16`, `efC=100`, `ef=140` on SIFT1M, with `l2_sqr` marked non-inlined so it shows up on its own.
 
-**Why the speedup will be smaller than 4x.**
-- Distance is only part of the work. If it takes 60% of the time and gets 4 times faster, the whole run gets about 1.8 times faster.
-- The 1M vectors take about 512 MB, and each graph hop reads a random spot in memory. If the CPU waits on those reads, faster arithmetic helps less.
+| Function | Share of samples |
+|---|---|
+| `l2_sqr` | 70.6% |
+| `search_layer` itself | 25.6% |
+| Heap pop | 3.2% |
 
-**Plan.**
-1. Profile the release build with Instruments (Time Profiler) to see how much time `l2_sqr` and memory waits take. Build with debug symbols and optimizations on, because `l2_sqr` is inlined and its samples may appear under `search_layer`.
-2. Write a NEON `l2_sqr`, keep the scalar version as the reference, and handle dimensions that are not a multiple of 4.
-3. Compare with `bench_distance`, then rerun the full `eval` sweep against the Phase 3 baseline.
-4. If the profile shows memory waits, try aligned vectors and prefetching the next neighbor's vector, and measure again.
+**Results.** All numbers come from this Mac.
 
-**Done when.** Recall@10 matches the baseline to within about 0.0003, and QPS and build time improve by more than the run-to-run noise (about 15%). Before-and-after numbers will go in this README and in `CLAUDE.md`.
+| Measurement | Scalar | NEON | Speedup |
+|---|---|---|---|
+| One distance call, 128 floats | 26.7 ns | 5.3 ns | 5.0x |
+| One distance call, 768 floats | 294 ns | 34 ns | 8.6x |
+| QPS at recall 0.95 (`ef` about 59) | about 7,700 | about 13,800 | 1.8x |
+| QPS at recall 0.99 (`ef` about 158) | about 3,500 | about 5,900 | 1.7x |
+| Build time, `M=16`, `efC=100` | 168 s and 180 s | 103 s and 104 s | 1.7x |
+
+The QPS and build rows come from two scalar runs and two NEON runs made back to back with seed 42. Recall@10 was identical to four digits at every `ef`.
+
+**Why 1.8x and not 5x.** Distance took 70.6% of query time. A 5x faster distance would give about 2.3x overall, and the measured gain is 1.8x. The remaining time goes to the rest of the search code, which did not change, and to waiting for vectors to arrive from memory. The profile cannot separate memory waits from arithmetic, so prefetching and memory layout are the next things to try, after a new profile of the NEON build.
+
+**How it was checked.** The unit tests compare the NEON and scalar functions for every dimension from 0 to 300 within a relative tolerance of 1e-5, and also cover unaligned pointers and an exact zero for identical vectors. The distance tests pass under AddressSanitizer, which catches reads past the end of an array. Recall at every `ef` matched the scalar build.
 
 ## Benchmark results
 
@@ -98,7 +108,7 @@ Status: not started. The Phase 3 numbers below are the baseline to beat.
 
 - Dataset: SIFT1M, 1,000,000 base vectors, 10,000 queries, 128 dimensions.
 - Metric: recall@10 against the exact ground truth, and queries per second (QPS).
-- Build: release preset, single thread, scalar distance function. SIMD arrives in Phase 4.
+- Build: release preset, single thread. Phase 3 numbers use the scalar distance function. Phase 4 above gives the NEON numbers.
 - Seed 42 unless stated. Brute force reaches recall 0.9995 on this data, not 1.0, because of distance ties in the ground truth. Treat 0.9995 as the practical ceiling.
 
 ### Recommended setting

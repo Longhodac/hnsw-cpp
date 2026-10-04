@@ -18,8 +18,10 @@ When the user explicitly says to "implement" or "build" something, write the com
 - Noise: seed changes recall by at most 0.0003. QPS for one config varies 3% to 16% between runs, so treat gaps under about 15% as noise and compare back-to-back runs.
 - Brute-force recall on SIFT1M is ~0.9995, not 1.0: distance ties vs the ground truth, not a bug.
 - Heuristic ablation (`--heuristic 0`) was not run. Optional follow-up.
-- Remaining: 4 SIMD/profiling, 5 concurrent inserts, 6 mmap persistence, 7 FAISS comparison. See README roadmap.
-- Baseline to beat in Phase 4: the build (161 s at efC=100) and the QPS figures above, measured with the scalar `l2_sqr`.
+- Phase 4 (SIMD): `l2_sqr` now uses NEON (`l2_sqr_neon`, 4 accumulators, 16 floats per pass); `l2_sqr_scalar` stays as the test reference. Distance call 26.7 ns to 5.3 ns at dim 128. End to end at M=16, efC=100: about 1.8x QPS (13.8K at recall 0.95, 5.9K at 0.99) and build 170 s to 104 s, recall unchanged. Details in the README.
+- Phase 3 QPS figures above were measured with the scalar distance, so they are the pre-Phase-4 baseline.
+- Phase 4 still open: profile the NEON build again, then try prefetching and memory layout if memory waits dominate.
+- Remaining after that: 5 concurrent inserts, 6 mmap persistence, 7 FAISS comparison. See README roadmap.
 
 ## Known limitations to remember
 - `search()` mutates the visited-tag scratch (`visited_`, `epoch_`), so it is not thread-safe; Phase 5 needs per-thread scratch.
