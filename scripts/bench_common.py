@@ -3,8 +3,10 @@
 The recall definition matches src/metrics.cpp, so a number from Python and a number from the
 C++ eval CLI mean the same thing.
 """
+import ctypes
 import os
 import resource
+import struct
 import subprocess
 import sys
 import time
@@ -44,14 +46,18 @@ class Dataset:
     gt: np.ndarray  # (nq, width) int32, true neighbors by base row
 
 
-def load_dataset(directory, max_queries: int = 0) -> Dataset:
-    """Load <dir>/<name>_{base,query}.fvecs and <name>_groundtruth.ivecs, name = dir basename."""
+def load_dataset(directory, max_queries: int = 0, with_base: bool = True) -> Dataset:
+    """Load <dir>/<name>_{base,query}.fvecs and <name>_groundtruth.ivecs, name = dir basename.
+
+    with_base=False skips the base file (an empty (0, dim) array stands in), for runs that load
+    a saved index and must not carry the 500 MB dataset in memory.
+    """
     d = Path(directory)
     name = d.name or d.parent.name
-    base = read_fvecs(d / f"{name}_base.fvecs")
     queries = read_fvecs(d / f"{name}_query.fvecs")
+    base = read_fvecs(d / f"{name}_base.fvecs") if with_base else np.empty((0, queries.shape[1]), np.float32)
     gt = read_ivecs(d / f"{name}_groundtruth.ivecs")
-    if queries.shape[1] != base.shape[1]:
+    if with_base and queries.shape[1] != base.shape[1]:
         raise ValueError(f"query dim {queries.shape[1]} != base dim {base.shape[1]}")
     if gt.shape[0] != queries.shape[0]:
         raise ValueError(f"ground truth has {gt.shape[0]} rows but there are {queries.shape[0]} queries")
@@ -95,3 +101,22 @@ def current_rss_mb() -> float:
     """Resident memory of this process right now, from ps (works on macOS and Linux)."""
     kb = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True)
     return int(kb.strip()) / 1e3
+
+
+def footprint_mb() -> float:
+    """Memory this process owns right now, in MB, counting pages macOS has compressed.
+
+    ps's resident size leaves compressed pages out, so it under-reports a freshly written
+    index (it read 285 MB to 698 MB for the same build). The physical footprint is dirty plus
+    compressed memory. Clean pages of a mapped file are not in it: they belong to the page
+    cache, which is why a loaded index's footprint stays near zero while current_rss_mb() grows.
+    Off macOS this falls back to the resident size.
+    """
+    if sys.platform != "darwin":
+        return current_rss_mb()
+    buf = ctypes.create_string_buffer(512)
+    proc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    if proc.proc_pid_rusage(os.getpid(), 0, buf) != 0:  # RUSAGE_INFO_V0
+        return current_rss_mb()
+    # rusage_info_v0: uuid[16], then 8-byte fields; ri_phys_footprint is the 9th after the uuid.
+    return struct.unpack_from("<Q", buf, 72)[0] / 1e6

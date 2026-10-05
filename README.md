@@ -1,6 +1,6 @@
 # hnsw-cpp
 
-A from-scratch C++20 implementation of HNSW (Hierarchical Navigable Small World), written to learn systems programming. It is tested and benchmarked on the SIFT dataset, and a comparison against FAISS is the last roadmap item. The core library has no ANN or linear-algebra dependencies.
+A from-scratch C++20 implementation of HNSW (Hierarchical Navigable Small World), written to learn systems programming. The tests and benchmarks use the SIFT dataset, and a comparison against FAISS is included. The core library has no ANN or linear-algebra dependencies.
 
 ## HNSW in simple words
 
@@ -29,7 +29,7 @@ Paper: [Malkov & Yashunin, *Efficient and robust approximate nearest neighbor se
 
 ## Layout
 
-`include/hnsw` holds the public headers and `src` holds the library. `tools/eval.cpp` is the evaluation CLI. `tests` and `bench` hold the unit tests and microbenchmarks. `scripts` holds dataset download and plotting, and `data` holds the datasets and is gitignored.
+`include/hnsw` holds the public headers and `src` holds the library. `tools/eval.cpp` is the evaluation CLI. `tests` and `bench` hold the unit tests and microbenchmarks. `python` holds the pybind11 module and its tests. `scripts` holds the dataset download, the Python benchmarks and the plots. `docs` holds the plots the README shows, and `data` holds the datasets and is gitignored.
 
 ## Build and test
 
@@ -39,7 +39,14 @@ You need CMake 3.24+, Ninja, and clang or gcc. CMake fetches GoogleTest and Goog
 cmake --preset release && cmake --build --preset release && ctest --preset release
 ```
 
-The presets are `debug`, `release` (-O3, native CPU tuning), `asan` (ASan + UBSan) and `tsan`. Binaries land in `build/<preset>/` (`eval`, `hnsw_tests`, `bench_distance`).
+The presets are `debug`, `release` (-O3, native CPU tuning), `asan` (ASan + UBSan), `tsan` and `python`. Binaries land in `build/<preset>/` (`eval`, `hnsw_tests`, `bench_distance`).
+
+The Python module and the FAISS comparison need a virtual environment. The `python` preset builds `build/python/python/hnsw_cpp*.so` with that environment's Python, then runs the C++ tests and the 35 Python tests.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install numpy matplotlib pybind11 faiss-cpu
+cmake --preset python && cmake --build --preset python && ctest --preset python
+```
 
 ## Dataset setup
 
@@ -68,11 +75,11 @@ Each run appends rows to `results/results.csv`. The plot script draws one curve 
 4. SIMD and profiling. NEON distance and prefetching done (about 2.8x faster queries). Heap work and memory layout still open.
 5. Concurrent inserts and searches. Done: 5.4x faster build and 4.9x more QPS on 10 threads.
 6. mmap persistence. Done: 1 ms load against a 69 s build.
-7. FAISS comparison with pybind11 bindings.
+7. FAISS comparison with pybind11 bindings. Done: about 1.5x faster build and about 1.3x to 1.7x more QPS at equal recall, with the same memory.
 
 ## Phase 4: SIMD distance
 
-Status: the NEON distance function and neighbor prefetching are done. The heap work and memory layout are not tried yet.
+Status: the NEON distance function and neighbor prefetching are done. The heap work and the memory layout remain open.
 
 **What changed.** `include/hnsw/distance.hpp` now has three functions. `l2_sqr_scalar` is the old loop and stays as the reference for tests. `l2_sqr_neon` processes 16 floats per pass with four NEON accumulators and fused multiply-add, then a 4-wide loop, then a scalar loop for leftover elements. `l2_sqr` calls the NEON version on ARM and the scalar version elsewhere.
 
@@ -134,7 +141,7 @@ Status: done. `add` and `search` are both safe to call from many threads at once
 - One global mutex covers the entry point and top layer. An insert takes it only when its node raises the top layer, which happens about log N times in a whole build.
 - A node's level is a hash of the seed and its id, not a draw from a shared generator, so it does not depend on thread timing.
 
-**How readers and writers stay safe.** A node's vector and link storage are written before its id goes into any neighbor slot. Slots are stored with release ordering and loaded with acquire ordering, so a thread that reads an id from a slot also sees that node's data. A search that overlaps a rewrite may read a mix of old and new ids from one list. Every id in a list is always a valid node on that layer, so the cost is at worst a skipped or repeated link.
+**How readers and writers stay safe.** An insert writes a node's vector and link storage before it puts the node's id into any neighbor slot. Inserts store slots with release ordering and searches load them with acquire ordering, so a thread that reads an id from a slot also sees that node's data. A search that overlaps a rewrite may read a mix of old and new ids from one list. Every id in a list is always a valid node on that layer, so the cost is at worst a skipped or repeated link.
 
 **Results.** SIFT1M, `M=16`, `efC=100`, seed 42, on a Mac with 4 performance and 6 efficiency cores. Build rows are two runs per thread count. Query rows are two runs each over 20 passes of the query set.
 
@@ -219,6 +226,78 @@ build/release/eval --dataset data/sift --index hnsw --load results/sift.idx --ef
 
 The first command builds in parallel and saves. The second loads without building and prints the load time, the first query's latency and the peak memory. `--verify 1` adds the link scan. Listing an `ef` twice shows the pass that pays for page faults next to the warm one.
 
+## Phase 7: comparison with FAISS
+
+Status: done. The comparison covers one dataset, one machine and one setting of `M` and `efConstruction`. The last list in this section says what it does not show.
+
+**What was built.** The Python module `hnsw_cpp` wraps the index with `add_batch`, `search_batch`, `save` and `load`. It accepts only `float32` C-contiguous arrays and raises `ValueError` for anything else instead of copying, and it releases the GIL while C++ threads work. `scripts/bench.py` runs either library through the same data loading, timer, recall code and CSV format, and times only the library call. `scripts/bench_extras.py` measures memory, files and latency. 35 Python tests cover the module and the shared helpers, and one of them fails if the GIL release is removed.
+
+**Protocol.** Both libraries index SIFT1M with `M=16` and `efConstruction=100`, and FAISS keeps its defaults for everything else (`faiss-cpu` 1.15.1, a NEON build). Each library runs in its own process. There are three rounds of eight processes, in different orders, so slow drift on the machine does not favor one side. Each `ef` gets one untimed pass and three timed passes, and the median is used. QPS at a recall target is read off each run's own recall-versus-QPS curve, so the libraries are compared at equal recall and not at equal `ef`. A result counts as a win only if its ratio is above 1.15 in every round.
+
+**Build and speed.** The ratio is ours over FAISS for QPS and FAISS over ours for build time, listed per round (A / B / C). Values are medians over the three rounds.
+
+| Threads | Measure | Ours | FAISS | Ratio per round | Verdict |
+|---|---|---|---|---|---|
+| 1 | build | 68.2 s | 102.4 s | 1.54 / 1.50 / 1.45 | ours faster in every round |
+| 10 | build | 12.7 s | 19.8 s | 1.54 / 1.57 / 1.56 | ours faster in every round |
+| 1 | QPS at recall 0.90 | 32,600 | 23,900 | 1.22 / 1.40 / 1.41 | ours faster in every round |
+| 1 | QPS at recall 0.95 | 21,800 | 14,800 | 1.07 / 1.47 / 1.54 | not established |
+| 1 | QPS at recall 0.99 | 9,200 | 5,450 | 1.58 / 1.68 / 1.70 | ours faster in every round |
+| 10 | QPS at recall 0.90 | 163,000 | 122,000 | 1.34 / 1.39 / 1.30 | ours faster in every round |
+| 10 | QPS at recall 0.95 | 115,700 | 83,100 | 1.40 / 1.43 / 1.38 | ours faster in every round |
+| 10 | QPS at recall 0.99 | 44,600 | 29,200 | 2.14 / 1.49 / 1.45 | ours faster in every round |
+
+The 1-thread cell at recall 0.95 fails the rule because round A's ratio is 1.07. In that round one pass at `ef=60` ran at 15,600 QPS, against about 21,400 in every other measurement of the same build. Rounds B and C give 1.47 and 1.54, but the rule was set before the data came in, so the cell stays "not established". Recall at the same `ef` differs by at most 0.0042 between the two libraries, so the speed gap does not come from lower recall.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/phase7_recall_qps_dark.png">
+  <img alt="Recall at 10 against queries per second for our index and FAISS on SIFT1M, at 1 thread and at 10 threads. Our curve sits above FAISS's at every recall from 0.88 to 0.999 in both panels." src="docs/phase7_recall_qps_light.png">
+</picture>
+
+Each panel has its own y-axis. Markers are the median over rounds at each `ef`, and the faint band spans the lowest to the highest round. The wide band at recall 0.95 in the 1-thread panel is the round A outlier.
+
+**Memory, files and latency.** Each round builds on 10 threads and saves the index, then a fresh process loads the file. Values are medians over the three rounds.
+
+| Measure | Ours | FAISS |
+|---|---|---|
+| Process memory growth after build | 666 MB | 674 MB |
+| File size | 653.6 MB | 656.3 MB |
+| Load time | 1.6 ms | 107 ms |
+| Load time with `IO_FLAG_MMAP` | not applicable | 81 ms |
+| Memory growth after load | 8 MB | 664 MB |
+| First query after load | 49.8 ms | 0.87 ms |
+| First 10,000 queries at `ef=60`, 1 thread | about 10,000 QPS | about 13,700 QPS |
+| Latency per call at `ef=60`, p50 / p99 | 46.6 / 64.4 µs | 73.9 / 103.5 µs |
+| Latency per call at `ef=140`, p50 / p99 | 98.5 / 128.2 µs | 163.2 / 213.3 µs |
+
+Latency is one query per Python call on one thread, so both libraries pay the same call cost, and recall is equal (0.9512 against 0.9516 at `ef=60`). Memory is the macOS physical footprint, which counts compressed pages. The `ps` resident size read 285 MB to 698 MB for the same build, so it was dropped.
+
+- FAISS accepted `IO_FLAG_MMAP` without an error, but its footprint still grew by 664 MB, so the data was copied and not mapped.
+- A loaded index of ours maps the file, so its pages come in on first use. That is why its first query takes 49.8 ms and its first full pass runs at about 10,000 QPS before it settles near 21,000. Ours still returns its first answer sooner (about 51 ms against 108 ms), but FAISS finishes the first 10,000 queries sooner. From these medians, ours pulls ahead after roughly 20,000 queries.
+- A cold page cache needs `sudo purge`, which needs root and was not run, so cold-start numbers are not measured.
+- Save times (0.16 s for ours, 0.10 s for FAISS) are not comparable. Ours writes a temporary file, flushes it to the device with `F_FULLFSYNC` and renames it. FAISS's `write_index` does none of that.
+
+**What this does not show.**
+- One dataset (SIFT1M, 128 dimensions), one machine (an M5 with 4 performance and 6 efficiency cores) and one setting of `M` and `efConstruction`. Other settings could change the picture.
+- The two graphs differ in construction details, so the same `M` and `efConstruction` do not give the same graph. That is why the comparison uses recall-matched curves.
+- FAISS was not profiled, so the cause of the gap is unknown. Prefetching, the four-accumulator NEON distance and the flat storage layout are candidates, but that is a guess.
+- The `faiss-cpu` wheel is a general PyPI build, not tuned for this chip.
+- The 10-thread runs used all 10 cores, efficiency cores included. FAISS showed more run-to-run spread at high `ef` on this Mac.
+
+**Reproduce.** Run each library in its own process, once per round, with a different `--tag` per round (A, B, C).
+
+```bash
+.venv/bin/python scripts/bench.py --lib ours  --dataset data/sift --threads 10 --tag A --csv results/comparison.csv
+.venv/bin/python scripts/bench.py --lib faiss --dataset data/sift --threads 10 --tag A --csv results/comparison.csv
+.venv/bin/python scripts/analyze_comparison.py results/comparison.csv      # medians, per-round ratios, verdicts
+.venv/bin/python scripts/plot_comparison.py results/comparison.csv --out-dir docs
+.venv/bin/python scripts/bench_extras.py --lib ours --phase build-save --dataset data/sift
+.venv/bin/python scripts/bench_extras.py --lib ours --phase load --dataset data/sift
+.venv/bin/python scripts/summarize_extras.py results/extras.csv
+```
+
+Repeat with `--threads 1` for the single-thread numbers and with `--lib faiss` for the FAISS side of `bench_extras.py`. Add `--faiss-mmap` to the FAISS load phase for the mmap run.
+
 ## Benchmark results
 
 ### Setup
@@ -242,6 +321,8 @@ Every row uses `M=16`, `efConstruction=100` and `ef=60`, where recall@10 is abou
 | Same index loaded from a file | same as built | 1.1 ms to load |
 
 Compared with the Phase 3 build, one thread is about 2.8x faster at queries, ten threads are about 14x faster, and a ten-thread build takes 13 s instead of 170 s. A saved index loads in about a millisecond where a rebuild takes 69 s. Recall did not change at any stage. The phase sections above have the tables behind each row.
+
+Against FAISS's HNSW at the same recall, the final build gives about 1.3x to 1.7x the QPS and builds about 1.5x faster, with the same memory. The Phase 7 section has the tables, the caveats and the one cell that was not established.
 
 ### Recommended setting
 
@@ -297,4 +378,4 @@ build/release/eval --dataset data/sift --index hnsw --M 16 --ef-construction 100
 scripts/plot_results.py results/sweep.csv -o docs/phase3_recall_qps.png
 ```
 
-The plot lives in `docs/` because `results/` and `*.png` are gitignored. `.gitignore` has an exception for `docs/*.png`.
+The plot lives in `docs/` because git ignores `results/` and `*.png`. `.gitignore` has an exception for `docs/*.png`.

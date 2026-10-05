@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from bench_common import current_rss_mb, peak_rss_mb, read_fvecs, read_ivecs, recall_at_k, time_calls  # noqa: E402
+from bench_common import (current_rss_mb, footprint_mb, load_dataset, peak_rss_mb, read_fvecs,  # noqa: E402
+                          read_ivecs, recall_at_k, time_calls)
 
 
 def write_vecs(path, matrix, dtype):
@@ -61,6 +62,20 @@ class Loaders(unittest.TestCase):
                 read_fvecs(mixed)
 
 
+class LoadDataset(unittest.TestCase):
+    def test_with_base_false_skips_the_base_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "toy"
+            d.mkdir()
+            write_vecs(d / "toy_query.fvecs", np.ones((3, 4), dtype=np.float32), np.float32)
+            write_vecs(d / "toy_groundtruth.ivecs", np.zeros((3, 5), dtype=np.int32), np.int32)
+            data = load_dataset(d, with_base=False)  # no toy_base.fvecs exists
+            self.assertEqual(data.base.shape, (0, 4))
+            self.assertEqual(data.queries.shape, (3, 4))
+            with self.assertRaises(FileNotFoundError):
+                load_dataset(d)
+
+
 class Recall(unittest.TestCase):
     gt = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int32)
 
@@ -105,6 +120,14 @@ class Timing(unittest.TestCase):
         self.assertEqual(len(seconds), 3)
         self.assertEqual(result, 5)
         self.assertTrue(all(s >= 0 for s in seconds))
+
+    def test_footprint_grows_by_the_memory_that_was_touched(self):
+        before = footprint_mb()
+        block = np.ones(200_000_000 // 8)  # 200 MB, every page written
+        grown = footprint_mb() - before
+        self.assertGreater(grown, 150)
+        self.assertLess(grown, 300)
+        del block
 
     def test_memory_helpers_return_plausible_numbers(self):
         self.assertGreater(current_rss_mb(), 1)
