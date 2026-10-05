@@ -3,7 +3,9 @@
 The recall definition matches src/metrics.cpp, so a number from Python and a number from the
 C++ eval CLI mean the same thing.
 """
+import os
 import resource
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -87,3 +89,9 @@ def peak_rss_mb() -> float:
     """Peak resident memory of this process so far. ru_maxrss is bytes on macOS, KB on Linux."""
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / 1e6 if sys.platform == "darwin" else peak / 1e3
+
+
+def current_rss_mb() -> float:
+    """Resident memory of this process right now, from ps (works on macOS and Linux)."""
+    kb = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True)
+    return int(kb.strip()) / 1e3
