@@ -20,7 +20,7 @@ import numpy as np
 
 from bench_common import current_rss_mb, load_dataset, peak_rss_mb, recall_at_k, time_calls
 
-COLUMNS = ["lib", "dataset", "n", "nq", "dim", "k", "M", "ef_construction", "build_threads",
+COLUMNS = ["tag", "lib", "dataset", "n", "nq", "dim", "k", "M", "ef_construction", "build_threads",
            "search_threads", "ef_search", "recall", "qps_median", "qps_min", "qps_max",
            "qps_spread", "build_s", "repeats", "rss_build_mb", "peak_rss_mb"]
 NOISE_MARGIN = 0.15  # repeats that differ by more than this are flagged
@@ -99,6 +99,7 @@ def main() -> None:
     ap.add_argument("--max-queries", type=int, default=0)
     ap.add_argument("--seed", type=int, default=42, help="our index only; FAISS has its own")
     ap.add_argument("--module-dir", default="build/python/python", help="where hnsw_cpp*.so is")
+    ap.add_argument("--tag", default="", help="free-text label stored in every CSV row, e.g. the round")
     ap.add_argument("--csv", default="results/bench.csv", help="'none' to skip")
     args = ap.parse_args()
     search_threads = args.search_threads or args.threads
@@ -128,7 +129,7 @@ def main() -> None:
         flag = "  NOISY" if spread > NOISE_MARGIN else ""
         print(f"ef_search={ef} recall@{args.k}={recall:.4f} qps_median={median:.1f} "
               f"min={min(qps):.1f} max={max(qps):.1f} spread={spread:.1%}{flag}")
-        rows.append({"lib": args.lib, "dataset": data.name, "n": n, "nq": nq, "dim": dim, "k": args.k,
+        rows.append({"tag": args.tag, "lib": args.lib, "dataset": data.name, "n": n, "nq": nq, "dim": dim, "k": args.k,
                      "M": args.M, "ef_construction": args.ef_construction,
                      "build_threads": args.threads, "search_threads": search_threads,
                      "ef_search": ef, "recall": f"{recall:.6f}", "qps_median": f"{median:.2f}",
